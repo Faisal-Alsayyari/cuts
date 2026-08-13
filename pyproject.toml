@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuts"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "av",
+    "scenedetect[opencv]",
+    "opencv-python",
+    "scikit-image",
+    "torch",
+    "numpy",
+    "pandas",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cuts*"]

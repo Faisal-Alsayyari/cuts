@@ -1,0 +1,18 @@
+av
+scenedetect[opencv]
+transnetv2-pytorch
+opencv-python
+scikit-image
+open-clip-torch
+torch
+numpy
+pandas
+matplotlib
+# retrieval milestone
+rapidocr-onnxruntime
+faster-whisper
+sentence-transformers
+rank-bm25
+imagehash
+pillow
+pyyaml
