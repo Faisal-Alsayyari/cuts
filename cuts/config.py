@@ -48,45 +48,6 @@ class TransNetV2Config:
 
 
 @dataclass
-class AutoShotConfig:
-    """Tuning knobs for the AutoShot detector (CVPR NAS 2023)."""
-
-    # Path to the cloned https://github.com/wentaozhu/AutoShot directory.
-    # The supernet_flattransf_*.py and linear.py modules must be importable
-    # from this location.
-    repo_path: str = ""
-    # Path to the pre-trained .pth checkpoint (downloaded from the project's
-    # Baidu Drive / Google Drive link).  Do NOT use the .pickle file — that
-    # contains cached predictions, not weights.
-    checkpoint_path: str = ""
-    # Probability threshold for converting per-frame scores to scene cuts.
-    # 0.296 is the best-F1 threshold reported in the AutoShot paper.
-    scene_threshold: float = 0.296
-    # Minimum per-frame probability to consider a frame "in" a gradual span.
-    gradual_threshold: float = 0.2
-    # Minimum consecutive elevated frames to classify a span as gradual.
-    min_gradual_frames: int = 3
-    # Inference device.  Empty string = auto-select (cuda if available).
-    device: str = ""
-
-
-@dataclass
-class OmniShotCutConfig:
-    """Tuning knobs for the OmniShotCut detector (UVA-CV-Lab, arXiv 2025)."""
-
-    # Path to the cloned https://github.com/UVA-Computer-Vision-Lab/OmniShotCut
-    # directory.  test_code/inference.py and the architecture/ package must be
-    # importable from this location.
-    repo_path: str = ""
-    # Path to the OmniShotCut_ckpt.pth checkpoint (available on HuggingFace at
-    # https://huggingface.co/uva-cv-lab/OmniShotCut).
-    checkpoint_path: str = ""
-    # Number of context frames passed to single_video_inference.  0 means no
-    # extra context (the default recommended by the authors).
-    num_context_frames: int = 0
-
-
-@dataclass
 class EnsembleConfig:
     """Tuning knobs for merging detector outputs (Stage 1 fusion)."""
 
@@ -119,22 +80,6 @@ class RefinementConfig:
     # cut (vs SSIM's 0.70–0.90), so 0.15 is the right breakpoint.
     transition_threshold: float = 0.15
     min_gradual_frames: int = 3
-    # Asymmetric search window: number of frames to decode BEFORE (window_left)
-    # and AFTER (window_right) the coarse candidate. Both default to half_window
-    # when None. Examples:
-    #   symmetric:       window_left=6, window_right=6  (same as half_window=6)
-    #   mildly left:     window_left=6, window_right=2
-    #   very left:       window_left=8, window_right=0  (window ends AT coarse frame)
-    window_left: Optional[int] = None
-    window_right: Optional[int] = None
-    # Confidence gating: skip refinement (pass through raw candidate unchanged)
-    # for cuts whose detector confidence >= this threshold. None = always refine.
-    # Only meaningful when candidates carry a non-zero confidence (TransNetV2).
-    confidence_threshold: Optional[float] = None
-    # Alternatively, refine only the bottom X% of candidates by confidence.
-    # Range (0, 100]. None = always refine. Takes precedence over
-    # confidence_threshold when both are set.
-    confidence_top_pct: Optional[float] = None
     # Asymmetric search window: number of frames to decode BEFORE (window_left)
     # and AFTER (window_right) the coarse candidate. Both default to half_window
     # when None. Examples:
@@ -303,8 +248,6 @@ class CutsConfig:
     # Sub-configs are dataclasses so they can be replaced wholesale in sweeps.
     pyscenedetect: PySceneDetectConfig = field(default_factory=PySceneDetectConfig)
     transnetv2: TransNetV2Config = field(default_factory=TransNetV2Config)
-    autoshot: AutoShotConfig = field(default_factory=AutoShotConfig)
-    omnishotcut: OmniShotCutConfig = field(default_factory=OmniShotCutConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     events: EventDetectorConfig = field(default_factory=EventDetectorConfig)

@@ -40,9 +40,6 @@ class BoundaryCandidate:
     # Detector confidence in [0, 1]. For TransNetV2 this is the peak per-frame
     # probability in a ±2 frame spike window around the boundary. 0.0 = unknown.
     confidence: float = 0.0
-    # Detector confidence in [0, 1]. For TransNetV2 this is the peak per-frame
-    # probability in a ±2 frame spike window around the boundary. 0.0 = unknown.
-    confidence: float = 0.0
 
     def __post_init__(self) -> None:
         # Normalize: if end_frame_idx wasn't set, mirror frame_idx (hard-cut

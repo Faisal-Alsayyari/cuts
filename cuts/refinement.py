@@ -56,9 +56,6 @@ class RefinedBoundary:
     # Wall time (seconds) spent computing the signal for this candidate only
     # (excludes batch decode time). Useful for per-candidate profiling.
     signal_time_sec: float = 0.0
-    # Wall time (seconds) spent computing the signal for this candidate only
-    # (excludes batch decode time). Useful for per-candidate profiling.
-    signal_time_sec: float = 0.0
     # Raw per-pair signal across the window — useful for visual debugging,
     # discarded by default to keep memory low. Set in `_refine_candidate`.
     signal_curve: Optional[List[float]] = None
@@ -188,74 +185,6 @@ def refine_candidates(
     wl = config.window_left if config.window_left is not None else config.half_window
     wr = config.window_right if config.window_right is not None else config.half_window
 
-    # --- Confidence gating ----------------------------------------------
-    # Determine which candidates to actually refine vs pass through.
-    to_refine_idx: List[int] = []
-    pass_through_idx: List[int] = []
-
-    if config.confidence_top_pct is not None:
-        # Bottom X% by confidence get refined; top (100-X)% pass through.
-        pct = max(0.0, min(100.0, config.confidence_top_pct))
-        confs = [c.confidence for c in cand_list]
-        if confs:
-            threshold = float(np.percentile(confs, pct))
-            for i, c in enumerate(cand_list):
-                if c.confidence <= threshold:
-                    to_refine_idx.append(i)
-                else:
-                    pass_through_idx.append(i)
-        else:
-            to_refine_idx = list(range(len(cand_list)))
-    elif config.confidence_threshold is not None:
-        tau = config.confidence_threshold
-        for i, c in enumerate(cand_list):
-            if c.confidence < tau:
-                to_refine_idx.append(i)
-            else:
-                pass_through_idx.append(i)
-    else:
-        to_refine_idx = list(range(len(cand_list)))
-
-    # --- Decode windows for candidates that need refinement -------------
-    to_refine_cands = [cand_list[i] for i in to_refine_idx]
-    windows = [(max(0, c.frame_idx - wl), c.frame_idx + wr) for c in to_refine_cands]
-    all_window_frames = collect_windows_single_pass(video_path, windows) if windows else []
-
-    # Build result list preserving original candidate order.
-    results: List[Optional[RefinedBoundary]] = [None] * len(cand_list)
-
-    # Refine gated-in candidates.
-    for i, (idx, cand, frames) in enumerate(zip(to_refine_idx, to_refine_cands, all_window_frames)):
-        t0 = _time.perf_counter()
-        result = _refine_candidate(cand, config, frames)
-        t1 = _time.perf_counter()
-        if result is None:
-            continue
-        result.coarse_frame_idx = cand.frame_idx
-        result.signal_time_sec = t1 - t0
-        results[idx] = result
-
-    # Pass through high-confidence candidates unchanged.
-    for idx in pass_through_idx:
-        cand = cand_list[idx]
-        # We don't have decoded frames, so construct a minimal RefinedBoundary
-        # from what the coarse detector told us (no PTS/time_sec available here
-        # without a frame index lookup — use 0.0 as sentinel; pipeline.py has
-        # the frame_index to enrich if needed).
-        results[idx] = RefinedBoundary(
-            frame_idx=cand.frame_idx,
-            end_frame_idx=cand.end_frame_idx,
-            pts=0,
-            time_sec=0.0,
-            type="gradual_transition" if cand.is_gradual else "hard_cut",
-            signal_peak=0.0,
-            signal_width=0,
-            sources=cand.sources,
-            coarse_frame_idx=cand.frame_idx,
-            signal_time_sec=0.0,
-        )
-
-    return [r for r in results if r is not None]
     # --- Confidence gating ----------------------------------------------
     # Determine which candidates to actually refine vs pass through.
     to_refine_idx: List[int] = []

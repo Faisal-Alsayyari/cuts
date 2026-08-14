@@ -19,6 +19,11 @@ Each system path returns predictions in the same shape so the evaluator can
 compare them apples-to-apples.
 """
 
+# NOTE: Systems E (AutoShot) and F (OmniShotCut) were removed — they required
+# external repo clones + checkpoints that were never present in this
+# environment and were never actually benchmarked. Re-add a detector arm here
+# the same way A/B/C are wired in if a future comparison is warranted.
+
 from __future__ import annotations
 
 import time
@@ -132,9 +137,9 @@ def run_full_pipeline(video_path: str, config: CutsConfig) -> PipelineResult:
 # ---------------------------------------------------------------------------
 
 def run_system(system: str, video_path: str, config: CutsConfig) -> PipelineResult:
-    """Run one of A/B/C/D/E/F and return predictions in PipelineResult shape.
+    """Run one of A/B/C/D and return predictions in PipelineResult shape.
 
-    A, B, C, E, F return UNREFINED detector boundaries — that is what the
+    A, B, C return UNREFINED detector boundaries — that is what the
     comparison table is meant to show.  D runs the full hybrid pipeline.
 
     Systems:
@@ -142,8 +147,6 @@ def run_system(system: str, video_path: str, config: CutsConfig) -> PipelineResu
         B — PySceneDetect AdaptiveDetector only
         C — TransNetV2 only
         D — Hybrid ensemble + Stage 2 refinement (full production pipeline)
-        E — AutoShot only (NAS-optimised 3-D ConvNet + Transformer, CVPR 2023)
-        F — OmniShotCut only (Shot-Query Transformer, arXiv 2025)
     """
     t_start = time.time()
     frame_index = build_frame_index(video_path, cache_dir=config.cache_dir)
@@ -162,12 +165,6 @@ def run_system(system: str, video_path: str, config: CutsConfig) -> PipelineResu
         # duplicate the orchestration logic.
         result = run_full_pipeline(video_path, config)
         return result
-    elif system == "E":
-        from cuts.detectors.autoshot_detector import detect as detect_autoshot
-        cands = detect_autoshot(video_path, config.autoshot)
-    elif system == "F":
-        from cuts.detectors.omnishotcut_detector import detect as detect_omnishotcut
-        cands = detect_omnishotcut(video_path, config.omnishotcut)
     else:
         raise ValueError(f"Unknown system: {system!r}")
 
@@ -285,7 +282,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("usage: python -m cuts.pipeline <video_path> [A|B|C|D|E|F]")
+        print("usage: python -m cuts.pipeline <video_path> [A|B|C|D]")
         sys.exit(1)
     path = sys.argv[1]
     system = sys.argv[2] if len(sys.argv) > 2 else "D"
