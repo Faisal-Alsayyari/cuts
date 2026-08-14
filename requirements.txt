@@ -1,18 +1,22 @@
+# Core: decoding, arrays, image ops
 av
-scenedetect[opencv]
-transnetv2-pytorch
-opencv-python
-scikit-image
-open-clip-torch
-torch
 numpy
-pandas
-matplotlib
-# retrieval milestone
-rapidocr-onnxruntime
-faster-whisper
-sentence-transformers
-rank-bm25
-imagehash
+opencv-python
 pillow
-pyyaml
+
+# Visual channel (DINOv2 via transformers)
+torch
+torchvision
+transformers
+
+# Text channel (on-screen text)
+rapidocr-onnxruntime
+
+# Speech channel (optional at runtime; degrades gracefully if absent)
+faster-whisper
+
+# Chapter titles
+anthropic
+
+# EFS Stages 2-3 query-driven selection (cuts/select.py) — optional
+# open-clip-torch

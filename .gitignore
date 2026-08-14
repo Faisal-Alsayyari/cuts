@@ -27,18 +27,17 @@ ENV/
 .coverage
 htmlcov/
 
-# ---- Model checkpoints (downloaded separately, see README) ----
-checkpoints/
+# ---- Model weights (downloaded on first use) ----
 *.pth
 *.ckpt
 
 # ---- Generated pipeline artifacts (recreated by running the tools) ----
-retrieval_index/
-refine_experiment/
-dummy.json
 
 # ---- OS / editor cruft ----
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+
+# ---- Generated index files ----
+*.events.json

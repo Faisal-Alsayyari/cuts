@@ -5,17 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cuts"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
+description = "Semantic indexing and temporal navigation of long-form video"
 dependencies = [
     "av",
-    "scenedetect[opencv]",
-    "opencv-python",
-    "scikit-image",
-    "torch",
     "numpy",
-    "pandas",
-    "matplotlib",
+    "opencv-python",
+    "pillow",
+    "torch",
+    "torchvision",
+    "transformers",
+    "rapidocr-onnxruntime",
+    "faster-whisper",
+    "anthropic",
 ]
+
+[project.scripts]
+cuts = "cuts.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

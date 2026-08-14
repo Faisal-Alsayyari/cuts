@@ -1,9 +1,22 @@
 """Single configuration dataclass for the entire `cuts` pipeline.
 
-All thresholds, window sizes, device strings, and model toggles live here so that
-no module body hardcodes a tuning constant. Every module receives a `CutsConfig`
-instance (or a sub-field of one) at call time. This makes hyperparameter sweeps
-on the benchmark trivial: instantiate a different config and re-run.
+`cuts` performs semantic indexing and temporal navigation of long-form video.
+The primary target is screen recordings (coding sessions), where the goal is
+to turn a multi-hour raw capture into a small set of labeled, timestamped
+chapters.
+
+All thresholds, window sizes, device strings, and model toggles live here so
+that no module body hardcodes a tuning constant. Every module receives a
+`CutsConfig` instance (or a sub-field of one) at call time, which makes
+hyperparameter sweeps trivial: instantiate a different config and re-run.
+
+Section names map onto the pipeline stages:
+
+    sampling     -> cuts.media           (decode 1 frame per N seconds)
+    dino / ocr / asr -> cuts.signals.*   (per-sample feature extraction)
+    segmentation -> cuts.segmentation    (EFS Stage 1: events from signals)
+    labeling     -> cuts.labeling        (Claude-written chapter titles)
+    select       -> cuts.select          (EFS Stages 2-3: query-driven frames)
 """
 
 from __future__ import annotations
@@ -11,232 +24,210 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-import torch  # only used here to pick the default device — cheap import
-
 
 def _default_device() -> str:
-    """Pick CUDA when available, else CPU. Centralized so every module agrees."""
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    """Pick the best available torch device. Centralized so every module agrees.
+
+    Order is CUDA -> MPS -> CPU. MPS matters here: the primary dev machine is
+    Apple Silicon, where a CUDA-only check silently degrades every model to
+    CPU and makes DINOv2 roughly an order of magnitude slower.
+    """
+    try:
+        import torch
+    except ImportError:  # torch is optional for config-only imports
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 @dataclass
-class PySceneDetectConfig:
-    """Tuning knobs for Arm A (PySceneDetect)."""
+class SamplingConfig:
+    """How densely we walk the video before any model runs.
 
-    # AdaptiveDetector adapts threshold to local content; lower values => more
-    # sensitive. Screen recordings are higher-contrast than film, so the film
-    # default (3.0) over-suppresses real boundaries. Start at 2.0 and tune.
-    adaptive_threshold: float = 2.0
-    # ContentDetector is the legacy detector; we still run it for recall.
-    content_threshold: float = 27.0
-    # Don't print PySceneDetect's progress bar inside batch jobs.
-    show_progress: bool = False
-
-
-@dataclass
-class TransNetV2Config:
-    """Tuning knobs for Arm B (TransNetV2)."""
-
-    # Probability threshold for `predictions_to_scenes`. Default 0.5 is tuned for
-    # broadcast video. Screen recordings often need 0.3–0.4 for subtle cuts.
-    scene_threshold: float = 0.4
-    # Threshold above which a frame is considered "in" a gradual transition,
-    # used to estimate the span of dissolves from `single_frame_predictions`.
-    gradual_threshold: float = 0.3
-    # Minimum number of consecutive elevated frames to call something gradual.
-    min_gradual_frames: int = 3
-
-
-@dataclass
-class EnsembleConfig:
-    """Tuning knobs for merging detector outputs (Stage 1 fusion)."""
-
-    # Two boundary candidates within this many frames of each other are merged
-    # into a single candidate. ±4 covers typical detector disagreement on the
-    # exact frame of a cut without collapsing real adjacent cuts.
-    merge_tolerance_frames: int = 4
-
-
-@dataclass
-class RefinementConfig:
-    """Tuning knobs for Stage 2 local frame-level refinement."""
-
-    # Half-window around each candidate to decode and analyze. Total decoded
-    # frames per candidate is 2*W + 1.
-    half_window: int = 8
-    # Weights for the combined per-frame discontinuity signal.
-    # Signal = w_hist * histogram_delta + w_mad * mean_abs_diff.
-    weight_hist: float = 0.5
-    weight_mad: float = 0.5
-    # Thumbnail size (long edge, pixels) for the MAD signal inside refinement
-    # windows. Coarse signal on a 256px thumbnail is more than sufficient to
-    # locate a spike at the correct frame pair. Set 0 to disable resizing.
-    refine_thumb_long_edge: int = 256
-    # Histogram bins per channel for HSV histograms. 32^3 is a good speed/recall
-    # tradeoff. Lower => faster, less discriminative.
-    hist_bins: int = 32
-    # gradual transitions (span of elevated signal > min_gradual_frames).
-    # Calibrated for MAD+hist combined signal: MAD gives 0.10–0.35 on a hard
-    # cut (vs SSIM's 0.70–0.90), so 0.15 is the right breakpoint.
-    transition_threshold: float = 0.15
-    min_gradual_frames: int = 3
-    # Asymmetric search window: number of frames to decode BEFORE (window_left)
-    # and AFTER (window_right) the coarse candidate. Both default to half_window
-    # when None. Examples:
-    #   symmetric:       window_left=6, window_right=6  (same as half_window=6)
-    #   mildly left:     window_left=6, window_right=2
-    #   very left:       window_left=8, window_right=0  (window ends AT coarse frame)
-    window_left: Optional[int] = None
-    window_right: Optional[int] = None
-    # Confidence gating: skip refinement (pass through raw candidate unchanged)
-    # for cuts whose detector confidence >= this threshold. None = always refine.
-    # Only meaningful when candidates carry a non-zero confidence (TransNetV2).
-    confidence_threshold: Optional[float] = None
-    # Alternatively, refine only the bottom X% of candidates by confidence.
-    # Range (0, 100]. None = always refine. Takes precedence over
-    # confidence_threshold when both are set.
-    confidence_top_pct: Optional[float] = None
-    # Post-filter: discard candidates whose elevated span is shorter than this
-    # AND whose signal returns to baseline within `motion_recovery_frames`. These
-    # are typically cursor-flick / animation false positives, not state changes.
-    # Disable (False) when refining hard-cut boundaries from a coarse detector:
-    # a genuine cut always recovers quickly because the new shot is stable.
-    motion_filter: bool = True
-    motion_recovery_frames: int = 3
-    motion_min_persistent_frames: int = 2
-
-
-@dataclass
-class EventDetectorConfig:
-    """Tuning knobs for Stage 3 sub-shot UI state change events."""
-
-    # Sample every N frames inside a shot when scanning for UI events.
-    # Smaller => slower but catches shorter events. 3 is a good default for
-    # 30/60 fps screen recordings.
-    sample_stride: int = 3
-
-    # ---- Stage E1: cheap coarse diff signal ---------------------------------
-    # Mean-abs pixel difference (0–1 normalised) threshold for a strided-sample
-    # pair to become a candidate. Replace the old ssim_delta_threshold for E1.
-    # 0.05 = 5% average pixel change per thumbnail pixel.
-    coarse_diff_threshold: float = 0.05
-    # Resize each sampled frame to this long-edge size (pixels) before the E1
-    # diff. UI state changes affect large regions so 256 px preserves the
-    # signal; full-res diff is unnecessary and memory-hungry here.
-    # Set 0 to disable resizing (useful for regression testing).
-    scan_thumb_long_edge: int = 256
-
-    # ---- Stage E2: candidate pruning ----------------------------------------
-    # Keep only the top-K candidates by diff magnitude before running E3 SSIM
-    # refinement. Caps E3 cost regardless of video length or content dynamics.
-    top_k_candidates: int = 50
-
-    # ---- Legacy / E3 --------------------------------------------------------
-    # Kept for backward compatibility. No longer used by the coarse E1 scan;
-    # the operative threshold for candidate selection is coarse_diff_threshold.
-    ssim_delta_threshold: float = 0.15
-    # Minimum shot length (in frames) worth scanning. Tiny shots cannot host
-    # meaningful sub-shot events and just add noise.
-    min_shot_length_frames: int = 30
-    # Whether to use CLIP to label the event type. Off by default (localization
-    # only is the prototype goal). When True, runs a CLIP forward pass per event.
-    use_clip_labeling: bool = False
-
-
-@dataclass
-class BenchmarkConfig:
-    """Tuning knobs for the benchmark evaluator."""
-
-    # Tolerance window (in frames) for matching a predicted hard cut to a GT
-    # hard cut. ±2 frames is the standard in the shot-detection literature.
-    hard_cut_tolerance_frames: int = 2
-    # Minimum interval IoU to count a gradual / UI event prediction as TP.
-    interval_iou_threshold: float = 0.5
-
-
-@dataclass
-class RetrievalConfig:
-    """Tuning knobs for the event-retrieval milestone (cuts/retrieval/*).
-
-    Indexing pipeline: TransNetV2 shots -> hybrid segmenter -> representative
-    frame sampling -> OCR + optional ASR -> BM25 + optional text/image
-    embeddings -> on-disk index. Query time: RRF hybrid over available signals.
+    The EFS paper samples candidate frames uniformly at 1 fps. That is also a
+    sensible default for screen recordings: a coding session changes state on
+    the order of seconds, not frames.
     """
 
-    # ---- Segmenter ---------------------------------------------------------
-    # Any TransNetV2 shot longer than this is split into equal sub-segments.
-    max_segment_sec: float = 20.0
-    # Any shot shorter than this is merged into the next shot. Avoids 0.2s
-    # transition fragments becoming their own searchable unit.
-    min_segment_sec: float = 2.0
+    # Seconds between sampled frames. 1.0 == the paper's 1 fps.
+    # Raise this for very long inputs; a 30-hour capture at 1 fps is 108k
+    # frames, where 2-4s sampling costs little recall and a lot less compute.
+    sample_interval_sec: float = 1.0
+    # Long-edge (pixels) each sampled frame is resized to before it is handed
+    # to any signal extractor. DINOv2 crops to 224 anyway, and OCR gets the
+    # full-resolution frame separately, so this only bounds peak memory.
+    frame_long_edge: int = 448
+    # Decoded frames are never all held at once; this bounds the working set
+    # handed to the embedder per batch. Tuned down for 8 GB unified memory.
+    batch_size: int = 16
 
-    # ---- Representative frame sampling ------------------------------------
-    # Seconds inset from segment start/end for the first/last representative
-    # frames. Keeps us off of fade/blank frames at shot boundaries.
-    sample_edge_inset_sec: float = 0.5
-    # Periodic sample spacing inside long segments (also applied even if the
-    # segment is at or under the max cap, only activates for >= this*2 seconds).
-    sample_period_sec: float = 5.0
-    # Hard cap on representative frames per segment regardless of length.
-    max_frames_per_segment: int = 6
-    # Thumbnail long-edge (pixels) when writing representative frames to disk.
-    # 720 keeps OCR happy and stays small. Set 0 to keep native resolution.
-    rep_frame_long_edge: int = 720
-    # JPEG quality for representative frames on disk.
-    rep_frame_jpeg_quality: int = 85
 
-    # ---- OCR ---------------------------------------------------------------
+@dataclass
+class DinoConfig:
+    """Visual embedding backbone for the EFS temporal similarity curve."""
+
+    # HuggingFace model id. ViT-S/14 (21M params) is the 8 GB-friendly choice;
+    # facebook/dinov2-base (86M) is meaningfully stronger if memory allows.
+    model_name: str = "facebook/dinov2-small"
+    # Use the pooled CLS embedding rather than patch tokens. The EFS similarity
+    # curve only needs one vector per frame.
+    use_cls_token: bool = True
+    # Inference device. Empty string = inherit CutsConfig.device.
+    device: str = ""
+
+
+@dataclass
+class OCRConfig:
+    """Text extracted from sampled frames.
+
+    For screen recordings this is often a *stronger* semantic signal than the
+    visual embedding: two different files of code look nearly identical to a
+    self-supervised natural-image model, but their text differs completely.
+    """
+
+    enabled: bool = True
     # Minimum OCR detection confidence to keep a line. rapidocr returns scores
     # in [0, 1]; 0.5 cuts most garbage without losing small UI text.
-    ocr_min_confidence: float = 0.5
-    # Perceptual-hash Hamming distance threshold for cross-segment OCR dedup.
-    # If the last rep-frame of segment k-1 and the first rep-frame of segment k
-    # are within this distance, reuse segment k-1's OCR and mark ocr_stale.
-    ocr_phash_dedup_threshold: int = 6
-    # Upscale factor applied to frames (and ROI crops) before OCR.
-    # 2–3x is strongly recommended for 1080p screen recordings. 1 = off.
-    ocr_upscale_factor: int = 2
-    # When True, write the exact images fed to OCR as PNGs under
-    # <index_dir>/ocr_debug/ for visual inspection.
-    ocr_save_debug_png: bool = False
-    # Optional list of fractional (x1, y1, x2, y2) crop boxes in [0, 1] space.
-    # OCR runs on each crop separately; results are merged. None = full frame.
+    min_confidence: float = 0.5
+    # Upscale factor applied before OCR. 2-3x is strongly recommended for
+    # 1080p screen recordings where editor/terminal text is small. 1 = off.
+    upscale_factor: int = 2
+    # Optional fractional (x1, y1, x2, y2) crop boxes in [0, 1] space. OCR runs
+    # on each crop separately and results are merged. None = full frame.
     # Example: [(0.0, 0.0, 1.0, 0.90)] to exclude a bottom 10% taskbar.
-    ocr_roi: Optional[List[Tuple[float, float, float, float]]] = None
-    # Minimum frames a cleaned line must appear in (ocr_text). Set to 1 to
-    # disable cross-frame filtering. Auto-capped at n_frames for the segment.
-    ocr_token_min_frames: int = 2
-    # High-confidence bypass: lines with max score >= this threshold are kept
-    # in ocr_text even if they appeared in fewer than ocr_token_min_frames.
-    ocr_high_conf_threshold: float = 0.85
-    # Verbose per-frame OCR breakdown; also enables ocr_save_debug_png.
-    ocr_debug: bool = False
+    roi: Optional[List[Tuple[float, float, float, float]]] = None
+    # OCR is by far the slowest per-frame signal. Run it on every Nth sampled
+    # frame and interpolate between them. 1 = OCR every sampled frame.
+    stride: int = 1
+    # Write the exact images fed to OCR as PNGs for visual inspection.
+    save_debug_png: bool = False
 
-    # ---- ASR ---------------------------------------------------------------
-    # Whether to attempt ASR at all. Lazy-imports faster-whisper; if False, no
-    # transcript text is indexed even when audio is present.
-    enable_asr: bool = False
-    # faster-whisper model name. "base" for CPU, "small" when a GPU is around.
-    asr_model: str = "base"
-    # Beam size for faster-whisper decoding. 1 = greedy (fastest).
-    asr_beam_size: int = 1
 
-    # ---- Index / embeddings -----------------------------------------------
-    # sentence-transformers model for segment text embeddings. MiniLM is 384-d,
-    # CPU-friendly, and strong for short paraphrase queries.
-    text_embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    enable_text_embeddings: bool = True
-    # open-clip image+text model for visual queries. Optional — off by default.
-    enable_image_embeddings: bool = False
+@dataclass
+class ASRConfig:
+    """Optional speech transcript, used both as a signal and as label context."""
+
+    # Auto = transcribe when the container has an audio stream, skip otherwise.
+    # Screen recordings frequently have no narration, so this must degrade
+    # gracefully rather than error.
+    enabled: bool = True
+    # faster-whisper model name. "base" for CPU/MPS, "small" with a GPU.
+    model: str = "base"
+    # Beam size for decoding. 1 = greedy (fastest).
+    beam_size: int = 1
+    # Skip silence so segment timings stay tight.
+    vad_filter: bool = True
+
+
+@dataclass
+class SegmentationConfig:
+    """EFS Stage 1 — event boundaries from a fused temporal similarity curve.
+
+    Implements arXiv 2603.00983 Stage 1 (Chen et al., "Event-Anchored Frame
+    Selection for Effective Long-Video Understanding"), generalized so the
+    similarity curve can fuse multiple signal channels rather than DINOv2
+    alone. The paper's exact behaviour is recovered with
+    `weight_dino=1.0, weight_ocr=0.0, weight_asr=0.0`.
+    """
+
+    # --- Similarity curve (paper eq. 1) ---------------------------------
+    # Sliding-window half-width l. The paper tests {3, 5, 7} and finds 3 best.
+    # Each frame's score averages cos(f_i, f_j) over neighbours j, weighted
+    # linearly by 1 - |i-j|/(l+1) so nearer neighbours dominate.
+    window_size: int = 3
+
+    # --- Channel fusion (our extension for the screen-recording domain) --
+    # Weights are normalized over whatever channels are actually available, so
+    # dropping OCR or ASR reweights the rest rather than shrinking the signal.
+    weight_dino: float = 0.5
+    weight_ocr: float = 0.5
+    weight_asr: float = 0.0
+
+    # --- Boundary count -------------------------------------------------
+    # Target number of events M. The paper sweeps 1-16 and finds 10-14 best
+    # for ~17-minute videos. None = derive from duration via minutes_per_event.
+    target_events: Optional[int] = None
+    # Used when target_events is None: aim for one event per this many minutes.
+    minutes_per_event: float = 4.0
+    # Hard floor/ceiling on the derived event count.
+    min_events: int = 3
+    max_events: int = 24
+    # An event shorter than this is merged into its neighbour regardless of the
+    # target count. Prevents 3-second "chapters" in the output.
+    min_event_sec: float = 20.0
+
+
+@dataclass
+class LabelingConfig:
+    """Chapter titles written by Claude from per-event evidence."""
+
+    enabled: bool = True
+    # Model id.
+    model: str = "claude-opus-5"
+    # Max tokens per labeling response. Titles themselves are a few words, but
+    # this budget also covers thinking, which is on by default on Opus 5 —
+    # sizing it to the visible output alone truncates the response.
+    max_tokens: int = 8000
+    # Reasoning depth. Labeling is a judgement call over short evidence, not a
+    # hard reasoning problem, so medium beats the default `high` on latency
+    # and cost without hurting title quality.
+    effort: str = "medium"
+    # Ask the API to fall back to another model if safety classifiers decline
+    # the request. Screen recordings rarely trigger this, but a refusal would
+    # otherwise silently cost the whole labeling pass.
+    use_fallbacks: bool = True
+    # How many representative frames per event are sent to the model.
+    # 0 = text-only labeling (OCR + transcript), which is much cheaper and
+    # often sufficient for screen recordings, where OCR already captures the
+    # semantically decisive content.
+    frames_per_event: int = 2
+    # Long-edge (pixels) of frames sent to the API. Keeps payloads small.
+    frame_long_edge: int = 768
+    # Characters of OCR text per event included in the prompt.
+    max_ocr_chars: int = 1500
+    # Characters of transcript per event included in the prompt.
+    max_transcript_chars: int = 1500
+    # Label all events in a single call so the model can keep titles
+    # non-redundant and consistent across the video. False = one call each.
+    batch_all_events: bool = True
+
+
+@dataclass
+class SelectConfig:
+    """EFS Stages 2-3 — query-driven keyframe selection.
+
+    This is the part of arXiv 2603.00983 that requires a text query. It is NOT
+    used by chapter generation (which is query-free); it exists for retrieval
+    and for the future "find the moment matching this description" workflow.
+    """
+
+    # Number of keyframes to return (paper tests k in {8, 16, 32, 64}).
+    top_k: int = 16
+    # MMR tradeoff: lambda * query_relevance - (1 - lambda) * redundancy.
+    mmr_lambda: float = 0.5
+    # Adaptive-threshold relaxation factor alpha. The paper finds 0.5 best on
+    # VideoMME and 0.1 on LongVideoBench/MLVU.
+    alpha: float = 0.5
+    # Scoring backend for query-frame relevance. "clip" uses open-clip and is
+    # the lightweight stand-in for the paper's BLIP2-ITM.
+    scorer: str = "clip"
     clip_model: str = "ViT-B-32"
     clip_pretrained: str = "openai"
 
-    # ---- Search -----------------------------------------------------------
+
+@dataclass
+class SearchConfig:
+    """Text search over indexed events (BM25 + optional embeddings, RRF)."""
+
+    # sentence-transformers model for event text embeddings.
+    text_embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    enable_text_embeddings: bool = True
     # Reciprocal Rank Fusion constant. 60 is the canonical default.
     rrf_k: int = 60
-    # Max results returned per query by default.
     default_top_k: int = 5
-    # Snippet window (characters on each side of a BM25 token hit).
     snippet_half_chars: int = 40
 
 
@@ -245,30 +236,37 @@ class CutsConfig:
     """Top-level config aggregating every sub-config plus runtime knobs."""
 
     device: str = field(default_factory=_default_device)
-    # Sub-configs are dataclasses so they can be replaced wholesale in sweeps.
-    pyscenedetect: PySceneDetectConfig = field(default_factory=PySceneDetectConfig)
-    transnetv2: TransNetV2Config = field(default_factory=TransNetV2Config)
-    ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
-    refinement: RefinementConfig = field(default_factory=RefinementConfig)
-    events: EventDetectorConfig = field(default_factory=EventDetectorConfig)
-    benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
-    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    dino: DinoConfig = field(default_factory=DinoConfig)
+    ocr: OCRConfig = field(default_factory=OCRConfig)
+    asr: ASRConfig = field(default_factory=ASRConfig)
+    segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
+    labeling: LabelingConfig = field(default_factory=LabelingConfig)
+    select: SelectConfig = field(default_factory=SelectConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
 
     # Optional cache directory for the frame_idx -> (pts, time_sec) lookup
-    # tables. None disables caching (recomputed every run).
+    # tables and computed embeddings. None disables caching.
     cache_dir: Optional[str] = None
 
     # When True, each pipeline stage prints its name, input size, and elapsed
-    # time to stdout. Enable via `python -m cuts.pipeline <video> D --debug`.
+    # time to stdout.
     verbose: bool = False
+
+    def resolved_device(self, override: str = "") -> str:
+        """Return `override` when set, else the top-level device."""
+        return override or self.device
 
 
 if __name__ == "__main__":
     # Quick smoke test: print the default config and confirm device selection.
     cfg = CutsConfig()
     print("Default CutsConfig:")
-    print(f"  device = {cfg.device}")
-    print(f"  pyscenedetect.adaptive_threshold = {cfg.pyscenedetect.adaptive_threshold}")
-    print(f"  transnetv2.scene_threshold = {cfg.transnetv2.scene_threshold}")
-    print(f"  refinement.half_window = {cfg.refinement.half_window}")
-    print(f"  events.sample_stride = {cfg.events.sample_stride}")
+    print(f"  device                       = {cfg.device}")
+    print(f"  sampling.sample_interval_sec = {cfg.sampling.sample_interval_sec}")
+    print(f"  dino.model_name              = {cfg.dino.model_name}")
+    print(f"  segmentation.window_size     = {cfg.segmentation.window_size}")
+    print(f"  segmentation weights (d/o/a) = "
+          f"{cfg.segmentation.weight_dino}/{cfg.segmentation.weight_ocr}/"
+          f"{cfg.segmentation.weight_asr}")
+    print(f"  labeling.model               = {cfg.labeling.model}")

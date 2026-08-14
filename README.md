@@ -1,120 +1,144 @@
 # cuts
 
-Frame-accurate shot boundary and UI state change event detection for raw
-devlog screen recordings. Inference-only; no training, no UI, no audio.
+Efficient semantic indexing and temporal navigation of long-form video.
 
-## Architecture
+Point it at a multi-hour screen recording and get back a chapter list:
 
-Two-stage coarse-to-fine, then a third sub-shot pass:
+```
+0:00 writing parser
+7:32 compiling
+9:11 debugging segfault
+21:54 reading docs
+29:13 implementing fix
+38:51 tests finally pass
+```
 
-1. **Stage 1 — Coarse candidates** (`cuts/detectors/`)
-   - Arm A: PySceneDetect (`AdaptiveDetector` + `ContentDetector`).
-   - Arm B: TransNetV2 (PyTorch port).
-   - Union, merged within ±4 frames by `cuts/detectors/ensemble.py`.
-2. **Stage 2 — Local refinement** (`cuts/refinement.py`)
-   - Decode ±W frames around each candidate with PyAV (every frame, no NONKEY).
-   - Per-frame discontinuity = weighted (HSV histogram Bhattacharyya) + (1 − SSIM).
-   - argmax → hard cut frame; elevated span ≥ N frames → gradual transition.
-   - Motion-vs-state-change post-filter drops cursor/animation false positives.
-3. **Stage 3 — UI state change events** (`cuts/event_detector.py`)
-   - Inside each shot, sample every N frames; SSIM-delta scan.
-   - Each elevated window is re-refined with Stage 2 to recover frame-accurate
-     `(start_frame, end_frame)`.
-   - Optional CLIP labeling (off by default).
-
-Frame indexing is ordinal (`enumerate(container.decode(stream))`), matching
-TransNetV2's internal frame ordering. Time conversions use the per-frame PTS
-table built by [cuts/frame_extractor.py](cuts/frame_extractor.py) — never
-`frame_idx / fps`, which is wrong for VFR.
+The primary target is screen captures of coding sessions, where the hard part
+is not finding visual cuts — there usually aren't any — but finding the points
+where *what the person is doing* changes.
 
 ## Install
 
-```powershell
-pip install -r requirements.txt
+Requires Python 3.12 (3.13 lacks wheels for `ctranslate2` / `rapidocr`).
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
+
+Model weights (DINOv2, the OCR ONNX models, Whisper) download on first use.
+Chapter titles need Claude API credentials — set `ANTHROPIC_API_KEY`, or run
+`ant auth login`. Without credentials the pipeline still runs and falls back to
+crude keyword-derived titles.
 
 ## Run
 
-```powershell
-# Full pipeline (System D) on a video
-python -m cuts.pipeline path\to\video.mp4 D
-
-# Other benchmark systems
-python -m cuts.pipeline path\to\video.mp4 A   # ContentDetector only
-python -m cuts.pipeline path\to\video.mp4 B   # AdaptiveDetector only
-python -m cuts.pipeline path\to\video.mp4 C   # TransNetV2 only
+```bash
+python -m cuts chapters session.mp4
+python -m cuts chapters session.mp4 --chapters 12 --ocr-stride 3 -v
+python -m cuts label session.events.json          # re-title without re-analyzing
 ```
 
-## Module debug entry points
+Useful flags: `--interval` (sampling rate), `--chapters` (target count),
+`--min-chapter`, `--ocr-stride` (main speed lever), `--no-ocr` / `--no-dino` /
+`--no-asr` (isolate a channel), `--backend`, `--no-labels`.
 
-Every module is independently runnable:
+Each run writes `<video>.events.json` — the full index, including per-event
+OCR text, transcript, sample indices, and boundary scores.
 
-| Module | Command |
-|--------|---------|
-| `cuts.config` | `python -m cuts.config` |
-| `cuts.frame_extractor` | `python -m cuts.frame_extractor <video>` |
-| `cuts.detectors.pyscenedetect_detector` | `python -m cuts.detectors.pyscenedetect_detector <video>` |
-| `cuts.detectors.transnetv2_detector` | `python -m cuts.detectors.transnetv2_detector <video>` |
-| `cuts.detectors.ensemble` | `python -m cuts.detectors.ensemble` |
-| `cuts.refinement` | `python -m cuts.refinement <video> <frame_idx> ...` |
-| `cuts.event_detector` | `python -m cuts.event_detector <video>` |
-| `cuts.benchmark.evaluator` | `python -m cuts.benchmark.evaluator` |
-| `cuts.benchmark.visualizer` | `python -m cuts.benchmark.visualizer <video> <out.png>` |
-| `cuts.pipeline` | `python -m cuts.pipeline <video> [A\|B\|C\|D]` |
+## How it works
 
-## Configuration
-
-All thresholds, window sizes, and the device selection live in
-[cuts/config.py](cuts/config.py) as a single `CutsConfig` dataclass with
-sub-dataclasses per stage. No module body hardcodes a tuning constant —
-modify or replace `CutsConfig` to sweep.
-
-## Benchmark
-
-Annotation CSV columns: `video_id, clip_path, type, label, start_frame, end_frame`.
-
-- `type` ∈ `hard_cut`, `gradual_transition`, `ui_event`
-- Hard cuts: matched within ±2 frames.
-- Gradual / UI: matched at interval IoU ≥ 0.5.
-
-Run an example evaluation:
-
-```python
-from cuts.benchmark.evaluator import evaluate, to_markdown_table
-from cuts.benchmark.schema import load_annotations
-from cuts.config import CutsConfig
-from cuts.pipeline import run_system
-
-cfg = CutsConfig()
-gts = load_annotations("benchmark/annotations.csv")
-results = []
-for system in ("A", "B", "C", "D"):
-    res = run_system(system, "video.mp4", cfg)
-    results.append(evaluate(
-        system=system,
-        predictions=list(res.boundaries) + list(res.events),
-        annotations=[a for a in gts if a.video_id == "video"],
-        config=cfg.benchmark,
-        video_duration_sec=res.duration_sec,
-        runtime_sec=res.runtime_sec,
-    ))
-print(to_markdown_table(results, "hard_cut"))
-print(to_markdown_table(results, "overall"))
 ```
+sample 1 fps  ->  per-frame signals  ->  fused similarity curve
+              ->  local minima  ->  merge to M events  ->  label
+```
+
+**Stage 1 (segmentation)** implements
+[arXiv 2603.00983](https://arxiv.org/abs/2603.00983), *"Event-Anchored Frame
+Selection for Effective Long-Video Understanding"* (Chen, Luo, Zeng, Lin, Xie,
+Chao, Ji, Zheng). Frames are sampled uniformly, each is scored by its weighted
+similarity to its temporal neighbours (paper eq. 1, window `l=3`, linearly
+decaying weights), boundaries are cut at local minima of that curve, and
+adjacent partitions are merged by mean-feature similarity until the target
+event count `M` is reached.
+
+**Our extension: the similarity curve fuses multiple channels.** The paper uses
+DINOv2 alone. DINOv2 is self-supervised on natural images, and screen
+recordings are a hard distribution shift — two completely different code
+screens are both "monospace text on a dark background". Measured on a synthetic
+coding-session fixture with six known activity changes:
+
+| Channel | Boundary recall | False positives |
+|---------|----------------:|----------------:|
+| DINOv2 only (paper-faithful) | 3/5 | 1 |
+| OCR text only | 5/5 | 0 |
+| Fused 50/50 (default) | 5/5 | 0 |
+
+Text carries this domain. Fusion costs nothing and keeps the visual channel for
+footage where it does help. Set `weight_dino=1.0, weight_ocr=0.0` to recover
+the paper's exact behaviour. Channels are z-scored before fusion because their
+native scales are incomparable (DINOv2 adjacent cosine sits around 0.99 on
+screen capture; TF-IDF cosine is far lower and much more spread out).
+
+**Labeling** sends every event's evidence to Claude in a single call, so titles
+stay distinct and consistently phrased across the video. Labeling each event
+separately reliably produces near-duplicate titles for adjacent events.
+
+**Stages 2-3 of the paper** (query-driven anchor selection + adaptive MMR) are
+implemented in [cuts/select.py](cuts/select.py) but are *not* used by chapter
+generation, which is query-free. They are the engine for the future "find the
+moment matching this description" workflow.
+
+## Layout
+
+| Module | Role |
+|--------|------|
+| [cuts/media.py](cuts/media.py) | VFR-safe decoding, uniform sampling, frame lookup |
+| [cuts/signals/dino.py](cuts/signals/dino.py) | DINOv2 embeddings (visual channel) |
+| [cuts/signals/ocr.py](cuts/signals/ocr.py) | On-screen text (text channel) |
+| [cuts/signals/asr.py](cuts/signals/asr.py) | Whisper transcript (speech channel) |
+| [cuts/signals/text_features.py](cuts/signals/text_features.py) | TF-IDF vectors for text channels |
+| [cuts/segmentation.py](cuts/segmentation.py) | EFS Stage 1 |
+| [cuts/labeling.py](cuts/labeling.py) | Chapter titles (Claude, heuristic fallback) |
+| [cuts/select.py](cuts/select.py) | EFS Stages 2-3, query-driven (unused today) |
+| [cuts/pipeline.py](cuts/pipeline.py) | Orchestrator |
+| [cuts/cli.py](cuts/cli.py) | CLI |
+
+Every module has a `python -m cuts.<module> <video>` debug entry point that
+runs and reports on that stage alone.
+
+All tuning constants live in [cuts/config.py](cuts/config.py) as one
+`CutsConfig` dataclass. No module body hardcodes a threshold.
+
+## Performance and limits
+
+Measured on an M3 / 8 GB, 143s fixture at 1 fps: **27s per video-minute** with
+OCR on every sample, **10.6s per video-minute** at `--ocr-stride 3`, with
+identical boundaries in both cases.
+
+OCR dominates; DINOv2 on MPS is a small fraction. Two known scaling limits:
+
+- **Decode is linear in total video length**, not in sample count, because PyAV
+  can only reliably seek to keyframes. A multi-hour input is decode-bound.
+  Keyframe-seek sampling is the fix if that becomes the bottleneck.
+- **Extrapolating to 30 hours** gives roughly 5 hours at `--ocr-stride 3`. That
+  is untested at that scale; raise `--interval` and `--ocr-stride` together for
+  very long inputs.
+
+Memory is bounded regardless of length — frames are reduced to features and
+discarded inside a single streaming pass, never accumulated.
 
 ## What this is not
 
 - No training. Inference only.
-- No web UI; only matplotlib timeline plots in [cuts/benchmark/visualizer.py](cuts/benchmark/visualizer.py).
-- No audio.
-- No LLM/VLM beyond optional CLIP for event labeling.
-- No streaming / distributed infrastructure.
+- No shot-boundary detection — it was removed; it does not describe what
+  changes in a screen recording.
+- No web UI yet.
+- No agent/skill layer yet.
 
-## Generated artifacts (not committed)
+## Status
 
-These directories/files are regenerated by running the tools and are excluded
-via [.gitignore](.gitignore) rather than tracked in git:
-
-- `retrieval_index/` \u2014 output of `python -m cuts.retrieval.cli index ...`.
-- `refine_experiment/` \u2014 debug thumbnails from `cuts.benchmark.refine_experiment`.
-- `.venv/` \u2014 local virtual environment.
+Segmentation is validated against a synthetic fixture with known ground truth
+(6/6 boundaries exact). It has **not** been validated on real devlog footage,
+and the Claude labeling path has not been run end-to-end (no credentials were
+available on the dev machine). Both are the next things to verify.
