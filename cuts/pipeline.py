@@ -13,9 +13,15 @@ obvious way to write it and does not survive contact with real input: a
 16 GB of pixel data. The streaming form holds one batch (16 frames, ~100 MB)
 regardless of video length.
 
-ASR is the exception: faster-whisper wants the whole audio track, so it runs
-as its own pass before sampling, and its output is aligned onto sample times
+ASR is the exception: faster-whisper wants a whole audio track, so it runs as
+its own pass, per source file, and its output is aligned onto sample times
 afterwards.
+
+Input may be one file or several. Several files are read in order as a single
+continuous timeline (see `cuts.media.Timeline`) — the case where one session
+was recorded across multiple days. Everything downstream of sampling sees one
+long video; only the joins are special, and they are handled by forcing a
+chapter boundary at each one.
 """
 
 from __future__ import annotations
@@ -23,15 +29,15 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from .config import CutsConfig
 from .media import (
-    get_duration_sec,
+    Timeline,
     has_audio,
-    iter_sampled_frames,
+    iter_timeline_frames,
     resize_long_edge,
 )
 from .schema import Event
@@ -43,7 +49,7 @@ class PipelineResult:
     """Everything one run produces."""
 
     video_id: str
-    video_path: str
+    video_path: str          # first source, for single-file compatibility
     duration_sec: float
     n_samples: int
     events: List[Event] = field(default_factory=list)
@@ -51,43 +57,58 @@ class PipelineResult:
     label_backend: str = "none"
     runtime_sec: float = 0.0
     stage_times: dict = field(default_factory=dict)
+    timeline: Optional[Timeline] = None
+
+    @property
+    def is_multi(self) -> bool:
+        return self.timeline is not None and self.timeline.is_multi
+
+
+def _timeline_id(timeline: Timeline) -> str:
+    """Name for the whole timeline: the first file's stem, plus a count."""
+    stem = Path(timeline.sources[0].path).stem
+    extra = len(timeline.sources) - 1
+    return stem if extra == 0 else f"{stem}+{extra}"
 
 
 def run(
-    video_path: str,
+    video_paths: Union[str, Sequence[str]],
     config: CutsConfig,
     label_backend: str = "auto",
     api_key: Optional[str] = None,
+    join_boundaries: bool = True,
 ) -> PipelineResult:
-    """Run the full pipeline on one video."""
+    """Run the full pipeline over one video or an ordered list of them.
+
+    Several files are treated as one continuous recording, in the order given.
+    With `join_boundaries` (the default) each file's start also forces a
+    chapter boundary: a new file means the camera stopped and started, which
+    is a real discontinuity even when the screen looks identical across it.
+    """
+    if isinstance(video_paths, str):
+        video_paths = [video_paths]
+    timeline = Timeline.build(video_paths)
+
     t_start = time.time()
     v = config.verbose
     stage_times: dict = {}
-    video_id = Path(video_path).stem
+    video_id = _timeline_id(timeline)
 
     def _mark(name: str, t0: float) -> None:
         stage_times[name] = time.time() - t0
         if v:
             print(f"  [{name}] {stage_times[name]:.1f}s")
 
-    duration_sec = get_duration_sec(video_path)
     if v:
-        print(f"video: {video_path}")
-        print(f"  duration {duration_sec:.0f}s, device={config.device}")
-
-    # ---- ASR (own pass; needs the whole audio track) ----------------------
-    asr_segments: List[Tuple[float, float, str]] = []
-    if config.asr.enabled and has_audio(video_path):
-        t0 = time.time()
-        if v:
-            print(f"  [asr] transcribing with {config.asr.model}...")
-        from .signals.asr import transcribe
-        asr_segments = transcribe(
-            video_path, config.asr, device=config.device, verbose=v
-        )
-        _mark("asr", t0)
-    elif v:
-        print("  [asr] skipped (no audio stream or disabled)")
+        if timeline.is_multi:
+            print(f"timeline: {len(timeline)} files, "
+                  f"{timeline.duration_sec / 60:.1f} min total")
+            for s in timeline.sources:
+                print(f"  {s.index}: {s.name} ({s.duration_sec / 60:.1f} min)")
+        else:
+            print(f"video: {timeline.first_path}")
+            print(f"  duration {timeline.duration_sec:.0f}s")
+        print(f"  device={config.device}")
 
     # ---- Streaming sample + per-frame signals -----------------------------
     t0 = time.time()
@@ -97,6 +118,8 @@ def run(
     frame_indices: List[int] = []
     times: List[float] = []
     ocr_raw: List[Optional[str]] = []
+    sample_source: List[int] = []      # source index per sample
+    source_starts: List[int] = []      # sample positions where a file begins
     emb_chunks: List[np.ndarray] = []
     batch: List = []
 
@@ -119,19 +142,34 @@ def run(
         print(f"  [sample] every {config.sampling.sample_interval_sec}s "
               f"(dino={want_dino}, ocr={want_ocr})")
 
-    for pos, sf in enumerate(iter_sampled_frames(
-        video_path, interval_sec=config.sampling.sample_interval_sec
+    current_source = -1
+    local_pos = 0
+
+    for pos, (sf, src) in enumerate(iter_timeline_frames(
+        timeline, interval_sec=config.sampling.sample_interval_sec
     )):
+        if src.index != current_source:
+            current_source = src.index
+            source_starts.append(pos)
+            # OCR stride restarts per file, so the first frame of every source
+            # is always read. Inheriting the previous file's text across a join
+            # would blur the one boundary we are most certain about.
+            local_pos = 0
+            if v and timeline.is_multi:
+                print(f"    -> {src.name} (global t={sf.time_sec:.0f}s)")
+
         frame_indices.append(sf.frame_idx)
         times.append(sf.time_sec)
+        sample_source.append(src.index)
 
         # OCR wants full resolution; the embedder does not, so downscale only
         # for the batch we hand to DINOv2.
         if want_ocr:
             ocr_raw.append(
                 ocr_image(sf.image, config.ocr)
-                if should_ocr(pos, config.ocr) else None
+                if should_ocr(local_pos, config.ocr) else None
             )
+        local_pos += 1
 
         if want_dino:
             sf.image = resize_long_edge(sf.image, config.sampling.frame_long_edge)
@@ -147,15 +185,45 @@ def run(
         _flush_batch()
     _mark("signals", t0)
 
+    duration_sec = timeline.duration_sec
     n_samples = len(frame_indices)
     if v:
         print(f"  {n_samples} samples collected")
     if n_samples == 0:
         return PipelineResult(
-            video_id=video_id, video_path=video_path,
+            video_id=video_id, video_path=timeline.first_path,
             duration_sec=duration_sec, n_samples=0,
             runtime_sec=time.time() - t_start, stage_times=stage_times,
+            timeline=timeline,
         )
+
+    # ---- ASR (own pass per source; needs whole audio tracks) --------------
+    # Runs after sampling because that is when the timeline offsets are final:
+    # a container's claimed duration can be short, and transcript times have to
+    # be shifted by each file's *actual* placement or they land in the wrong
+    # chapter.
+    asr_segments: List[Tuple[float, float, str]] = []
+    if config.asr.enabled:
+        audible = [s for s in timeline.sources if has_audio(s.path)]
+        if audible:
+            t0 = time.time()
+            if v:
+                print(f"  [asr] transcribing {len(audible)} source(s) "
+                      f"with {config.asr.model}...")
+            from .signals.asr import transcribe
+            for s in audible:
+                segs = transcribe(
+                    s.path, config.asr, device=config.device, verbose=v
+                )
+                asr_segments.extend(
+                    (start + s.time_offset, end + s.time_offset, text)
+                    for start, end, text in segs
+                )
+            _mark("asr", t0)
+        elif v:
+            print("  [asr] skipped (no audio stream in any source)")
+    elif v:
+        print("  [asr] disabled")
 
     dino = (
         np.concatenate(emb_chunks) if emb_chunks
@@ -165,7 +233,7 @@ def run(
     ocr_texts: Optional[List[str]] = None
     if want_ocr:
         from .signals.ocr import carry_forward
-        ocr_texts = carry_forward(ocr_raw)
+        ocr_texts = carry_forward(ocr_raw, reset_at=source_starts)
 
     transcript_texts: Optional[List[str]] = None
     if asr_segments:
@@ -184,11 +252,13 @@ def run(
     events = segment(
         inp, config.segmentation, video_id=video_id,
         duration_sec=duration_sec, verbose=v,
+        forced_bounds=source_starts if join_boundaries else None,
     )
     _mark("segmentation", t0)
 
     # Attach each event's evidence, so labeling and search have it.
     _attach_evidence(events, inp, frame_indices)
+    _attach_sources(events, timeline)
 
     from .segmentation import build_channels
     channels_used = list(build_channels(inp, config.segmentation).keys())
@@ -199,14 +269,14 @@ def run(
         t0 = time.time()
         from .labeling import label_events
         backend = label_events(
-            events, video_path, config.labeling,
+            events, timeline, config.labeling,
             backend=label_backend, api_key=api_key, verbose=v,
         )
         _mark("labeling", t0)
 
     return PipelineResult(
         video_id=video_id,
-        video_path=video_path,
+        video_path=timeline.first_path,
         duration_sec=duration_sec,
         n_samples=n_samples,
         events=events,
@@ -214,7 +284,22 @@ def run(
         label_backend=backend,
         runtime_sec=time.time() - t_start,
         stage_times=stage_times,
+        timeline=timeline,
     )
+
+
+def _attach_sources(events: List[Event], timeline: Timeline) -> None:
+    """Record which file each event opens in, and where inside it.
+
+    A global timestamp is not something you can scrub to when the recording
+    lives in five separate files, so every event carries the file and in-file
+    offset alongside it.
+    """
+    for e in events:
+        src, local = timeline.local_time(e.start_time)
+        e.source_path = src.path
+        e.source_index = src.index
+        e.source_start_time = local
 
 
 def _attach_evidence(

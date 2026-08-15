@@ -1,11 +1,18 @@
 """Command-line interface.
 
-    python -m cuts chapters <video> [options]     # video -> chapter list
+    python -m cuts chapters <video...> [options]  # video(s) -> chapter list
+    python -m cuts probe <video...>               # what a run would cost
     python -m cuts label <events.json> [backend]  # (re)label an existing index
 
 `chapters` is the primary command and the product's whole surface today: point
 it at a recording, get back a timestamped chapter list you can paste into a
 description or an editor's marker track.
+
+Several files given to `chapters` are treated as one continuous recording, in
+the order written on the command line — the case where a single session was
+captured across multiple days. Shell globs sort lexicographically, which is
+chronological only if the filenames were numbered that way, so check the
+order `probe` echoes back before trusting it.
 """
 
 from __future__ import annotations
@@ -43,9 +50,13 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                         "credentials are present, else heuristic)")
     p.add_argument("--no-labels", action="store_true",
                    help="segment only; skip titling entirely")
+    p.add_argument("--no-join-boundaries", action="store_true",
+                   help="with multiple inputs, do NOT force a chapter break "
+                        "at each file join (default: force one, since a new "
+                        "file is a real break in the recording)")
     p.add_argument("-o", "--out", default=None,
                    help="write the full index JSON here "
-                        "(default: <video_stem>.events.json beside the video)")
+                        "(default: <first_video_stem>.events.json beside it)")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -72,25 +83,82 @@ def _config_from_args(args) -> CutsConfig:
     return cfg
 
 
+def _resolve_videos(paths) -> list:
+    """Absolute paths, in the order given, erroring on the first missing one."""
+    out = []
+    for p in paths:
+        full = str(Path(p).resolve())
+        if not os.path.exists(full):
+            print(f"error: video not found: {full}", file=sys.stderr)
+            sys.exit(2)
+        out.append(full)
+    return out
+
+
+def _default_out_path(videos) -> str:
+    """Where the index goes when -o was not given.
+
+    Named after the first file, with a count suffix when there are several, so
+    indexing the same first file with different companions does not silently
+    overwrite an earlier run.
+    """
+    first = Path(videos[0])
+    if len(videos) == 1:
+        return str(first.with_suffix(".events.json"))
+    return str(first.with_name(f"{first.stem}+{len(videos) - 1}.events.json"))
+
+
+def cmd_probe(args) -> int:
+    """Report what the inputs are and roughly what a run will cost."""
+    from .media import probe_video
+
+    videos = _resolve_videos(args.video)
+    total = 0.0
+    print(f"{len(videos)} file(s), in the order they will be read:\n")
+    for i, path in enumerate(videos):
+        meta = probe_video(path)
+        if meta["error"]:
+            print(f"  {i}: {Path(path).name}  ERROR: {meta['error']}")
+            continue
+        dur = float(meta["duration_sec"])
+        print(f"  {i}: {Path(path).name}")
+        print(f"       starts at {format_timestamp(total)}  "
+              f"length {format_timestamp(dur)}")
+        print(f"       {meta['width']}x{meta['height']} @ {meta['fps']:.2f}fps "
+              f"{meta['codec']}   audio: "
+              f"{'yes' if meta['has_audio'] else 'no'}")
+        total += dur
+
+    mins = total / 60.0
+    print(f"\ntimeline: {format_timestamp(total)} ({mins:.1f} min)")
+    # Measured on an M3: ~27 s per video-minute with OCR on every sample,
+    # ~11 s/min at stride 3. Only ever benchmarked on a short clip, so this is
+    # an order-of-magnitude estimate, not a promise.
+    print(f"estimated runtime: ~{mins * 27 / 60:.0f} min at default settings, "
+          f"~{mins * 11 / 60:.0f} min with --ocr-stride 3")
+    print("(estimates extrapolated from a short clip; treat as rough)")
+    return 0
+
+
 def cmd_chapters(args) -> int:
-    video = str(Path(args.video).resolve())
-    if not os.path.exists(video):
-        print(f"error: video not found: {video}", file=sys.stderr)
-        return 2
+    videos = _resolve_videos(args.video)
 
     from .pipeline import run
 
     cfg = _config_from_args(args)
-    result = run(video, cfg, label_backend=args.backend)
+    result = run(videos, cfg, label_backend=args.backend,
+                 join_boundaries=not args.no_join_boundaries)
 
     if not result.events:
         print("error: no events produced (video too short, or no usable signal)",
               file=sys.stderr)
         return 1
 
-    out_path = args.out or str(Path(video).with_suffix(".events.json"))
-    write_events(out_path, result.video_id, video, result.events,
+    out_path = args.out or _default_out_path(videos)
+    sources = result.timeline.to_dicts() if result.timeline else None
+    write_events(out_path, result.video_id, videos[0], result.events,
                  duration_sec=result.duration_sec,
+                 sources=sources,
                  extra={
                      "n_samples": result.n_samples,
                      "channels": result.channels_used,
@@ -98,12 +166,16 @@ def cmd_chapters(args) -> int:
                      "stage_times": result.stage_times,
                  })
 
+    multi = result.is_multi
     print()
-    print(to_chapter_list(result.events))
+    print(to_chapter_list(result.events, show_source=multi))
     print()
     per_min = result.runtime_sec / max(result.duration_sec / 60.0, 1e-6)
+    across = f"across {format_timestamp(result.duration_sec)}"
+    if multi:
+        across += f" of {len(result.timeline)} files"
     print(f"{len(result.events)} chapters from {result.n_samples} samples "
-          f"across {format_timestamp(result.duration_sec)}")
+          f"{across}")
     print(f"signals: {', '.join(result.channels_used) or 'none'}   "
           f"titles: {result.label_backend}")
     print(f"{result.runtime_sec:.1f}s total ({per_min:.1f}s per video-minute)")
@@ -120,16 +192,20 @@ def cmd_label(args) -> int:
         print(f"error: not found: {path}", file=sys.stderr)
         return 2
 
+    from .media import Timeline
+
     cfg = CutsConfig()
     cfg.verbose = args.verbose
     payload = read_events(path)
     events = payload["events"]
-    used = label_events(events, payload["video_path"], cfg.labeling,
+    timeline = Timeline.from_dicts(payload["sources"])
+    used = label_events(events, timeline, cfg.labeling,
                         backend=args.backend, verbose=args.verbose)
     write_events(path, payload["video_id"], payload["video_path"], events,
-                 duration_sec=payload.get("duration_sec", 0.0))
+                 duration_sec=payload.get("duration_sec", 0.0),
+                 sources=payload["sources"])
     print()
-    print(to_chapter_list(events))
+    print(to_chapter_list(events, show_source=timeline.is_multi))
     print(f"\ntitles: {used}")
     return 0
 
@@ -141,10 +217,17 @@ def main(argv=None) -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_ch = sub.add_parser("chapters", help="turn a video into a chapter list")
-    p_ch.add_argument("video")
+    p_ch = sub.add_parser("chapters", help="turn video(s) into a chapter list")
+    p_ch.add_argument("video", nargs="+",
+                      help="one or more video files, in chronological order; "
+                           "several are read as one continuous recording")
     _add_common(p_ch)
     p_ch.set_defaults(func=cmd_chapters)
+
+    p_pr = sub.add_parser("probe",
+                          help="show input metadata and estimated runtime")
+    p_pr.add_argument("video", nargs="+")
+    p_pr.set_defaults(func=cmd_probe)
 
     p_lb = sub.add_parser("label", help="(re)label an existing events.json")
     p_lb.add_argument("events_json")

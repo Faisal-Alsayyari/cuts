@@ -25,10 +25,10 @@ import base64
 import json
 import os
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .config import LabelingConfig
-from .media import decode_frames_at, resize_long_edge
+from .media import Timeline, decode_frames_at, resize_long_edge
 from .schema import Event, format_timestamp
 from .signals.text_features import tokenize
 
@@ -106,12 +106,17 @@ def _pick_representative(event: Event, n: int) -> List[int]:
     return [samples[min(len(samples) - 1, int(step * (k + 1)))] for k in range(n)]
 
 
-def _event_evidence(event: Event, config: LabelingConfig) -> str:
+def _event_evidence(
+    event: Event, config: LabelingConfig, show_source: bool = False
+) -> str:
     """Render one event's text evidence into the prompt."""
-    parts = [
+    header = (
         f"[{event.event_id}] {format_timestamp(event.start_time)}"
         f"-{format_timestamp(event.end_time)} ({event.duration_sec:.0f}s)"
-    ]
+    )
+    if show_source and event.source_name:
+        header += f"  session: {event.source_name} @ {event.source_timestamp()}"
+    parts = [header]
     ocr = (event.ocr_text or "").strip()
     if ocr:
         parts.append(f"on-screen text:\n{ocr[: config.max_ocr_chars]}")
@@ -124,14 +129,17 @@ def _event_evidence(event: Event, config: LabelingConfig) -> str:
 
 
 def _encode_frames(
-    video_path: str,
+    timeline: Timeline,
     events: Sequence[Event],
     config: LabelingConfig,
     verbose: bool = False,
 ) -> Dict[str, List[str]]:
     """Decode and base64-JPEG-encode representative frames, keyed by event_id.
 
-    All frames across all events come from one decode pass.
+    Frame indices are global across the timeline, so they are first grouped by
+    the file that owns them and each file is then decoded once. Decoding is a
+    sequential scan, so per-file batching is the difference between one pass
+    over each source and one pass per frame.
     """
     if config.frames_per_event <= 0:
         return {}
@@ -144,15 +152,34 @@ def _encode_frames(
     if not all_idx:
         return {}
 
+    # global frame index -> (source path, local frame index)
+    by_source: Dict[str, List[int]] = {}
+    local_of: Dict[int, Tuple[str, int]] = {}
+    for g in all_idx:
+        found = timeline.local_frame(g)
+        if found is None:
+            # Single-source indexes written before frame_span was recorded, and
+            # any index outside every known span, fall back to the first file.
+            src, local = timeline.sources[0], g
+        else:
+            src, local = found
+        local_of[g] = (src.path, local)
+        by_source.setdefault(src.path, []).append(local)
+
     if verbose:
-        print(f"  decoding {len(all_idx)} frames for labeling...")
-    decoded = decode_frames_at(video_path, all_idx)
+        print(f"  decoding {len(all_idx)} frames for labeling "
+              f"across {len(by_source)} file(s)...")
+
+    decoded_by_source: Dict[str, Dict[int, "object"]] = {
+        path: decode_frames_at(path, idxs) for path, idxs in by_source.items()
+    }
 
     out: Dict[str, List[str]] = {}
     for eid, idxs in wanted.items():
         encoded: List[str] = []
-        for i in idxs:
-            img = decoded.get(i)
+        for g in idxs:
+            path, local = local_of[g]
+            img = decoded_by_source.get(path, {}).get(local)
             if img is None:
                 continue
             img = resize_long_edge(img, config.frame_long_edge)
@@ -168,17 +195,28 @@ def _build_content(
     events: Sequence[Event],
     frames: Dict[str, List[str]],
     config: LabelingConfig,
+    n_sources: int = 1,
 ) -> List[Dict[str, Any]]:
     """Build the user-turn content blocks: evidence text interleaved with frames."""
-    blocks: List[Dict[str, Any]] = [{
-        "type": "text",
-        "text": (
-            f"This recording has {len(events)} segments, in order. "
-            f"Write a title for each."
-        ),
-    }]
+    preamble = (
+        f"This recording has {len(events)} segments, in order. "
+        f"Write a title for each."
+    )
+    if n_sources > 1:
+        # Without this the model tends to force narrative continuity across a
+        # join — "continuing the refactor" — when the two sides are unrelated
+        # work done days apart.
+        preamble += (
+            f" The recording is split across {n_sources} separate capture "
+            f"sessions, marked below; work does not necessarily continue "
+            f"across a session change."
+        )
+    blocks: List[Dict[str, Any]] = [{"type": "text", "text": preamble}]
     for e in events:
-        blocks.append({"type": "text", "text": _event_evidence(e, config)})
+        blocks.append({
+            "type": "text",
+            "text": _event_evidence(e, config, show_source=n_sources > 1),
+        })
         for b64 in frames.get(e.event_id, []):
             blocks.append({
                 "type": "image",
@@ -310,13 +348,16 @@ def _heuristic_labels(events: Sequence[Event]) -> List[Dict[str, str]]:
 
 def label_events(
     events: List[Event],
-    video_path: str,
+    source: Union[str, Timeline],
     config: LabelingConfig,
     backend: str = "claude",
     api_key: Optional[str] = None,
     verbose: bool = False,
 ) -> str:
     """Set `title` on each event in place. Returns the backend actually used.
+
+    `source` is the `Timeline` the events were segmented from, or a single
+    video path (which is wrapped into a one-file timeline).
 
     `backend` is "claude", "heuristic", or "auto". Under "auto" — and under
     "claude" when the call fails — labeling degrades to heuristic rather than
@@ -326,14 +367,17 @@ def label_events(
     if not events or not config.enabled:
         return "none"
 
+    timeline = Timeline.build([source]) if isinstance(source, str) else source
+
     have_creds = bool(api_key or os.environ.get("ANTHROPIC_API_KEY"))
     if backend == "auto":
         backend = "claude" if have_creds else "heuristic"
 
     if backend == "claude":
         try:
-            frames = _encode_frames(video_path, events, config, verbose=verbose)
-            content = _build_content(events, frames, config)
+            frames = _encode_frames(timeline, events, config, verbose=verbose)
+            content = _build_content(events, frames, config,
+                                     n_sources=len(timeline))
             if verbose:
                 n_img = sum(len(v) for v in frames.values())
                 print(f"  labeling {len(events)} events via {config.model} "
@@ -371,9 +415,10 @@ if __name__ == "__main__":
     cfg = CutsConfig()
     payload = read_events(path)
     evs = payload["events"]
-    used = label_events(evs, payload["video_path"], cfg.labeling,
-                        backend=backend, verbose=True)
+    tl = Timeline.from_dicts(payload["sources"])
+    used = label_events(evs, tl, cfg.labeling, backend=backend, verbose=True)
     write_events(path, payload["video_id"], payload["video_path"], evs,
-                 duration_sec=payload.get("duration_sec", 0.0))
+                 duration_sec=payload.get("duration_sec", 0.0),
+                 sources=payload["sources"])
     print(f"\nbackend: {used}\n")
     print(to_chapter_list(evs))

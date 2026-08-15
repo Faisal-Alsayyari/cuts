@@ -15,6 +15,17 @@ What this module guarantees:
   pipeline (the EFS paper's "uniformly sampled at 1 fps" candidate set).
 * `decode_frames_at(path, indices)` pulls a specific set of frames in one pass,
   for representative thumbnails after segmentation has run.
+* `Timeline` / `iter_timeline_frames` present *several* files as one continuous
+  virtual timeline, which is how a session split across days is analyzed.
+
+Why a virtual timeline rather than concatenating the files with ffmpeg: a
+stream-copy concat only works when every input shares a codec, resolution and
+pixel format, which recordings made on different days routinely do not. The
+fallback is a full re-encode — hours of CPU and tens of gigabytes of scratch
+disk for eight hours of capture, before any analysis has started. Worse, the
+merged file forgets which recording a moment came from, and "file 2 at
+14:22" is exactly what you need to actually go find the footage. Reading the
+files in sequence costs nothing extra and keeps that mapping.
 
 Memory note: `iter_sampled_frames` is a generator that yields full-resolution
 frames one at a time and never accumulates. Consumers are expected to batch a
@@ -222,6 +233,223 @@ def iter_sampled_frames(
         container.close()
 
 
+# ---------------------------------------------------------------------------
+# Multi-file timelines
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Source:
+    """One input file's placement on the global timeline.
+
+    `time_offset` and `frame_offset` convert this file's local coordinates into
+    global ones: ``global = local + offset``. Both are finalized by
+    `iter_timeline_frames`, since the true extent of a file is only known once
+    it has been read.
+
+    `frame_span` is one past the last frame index this source contributed, so
+    global frame ranges are ``[frame_offset, frame_offset + frame_span)`` and
+    never overlap between sources.
+    """
+
+    path: str
+    index: int
+    duration_sec: float = 0.0
+    time_offset: float = 0.0
+    frame_offset: int = 0
+    frame_span: int = 0
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.path)
+
+    @property
+    def end_time(self) -> float:
+        return self.time_offset + self.duration_sec
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "path": self.path,
+            "index": self.index,
+            "duration_sec": self.duration_sec,
+            "time_offset": self.time_offset,
+            "frame_offset": self.frame_offset,
+            "frame_span": self.frame_span,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, object]) -> "Source":
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in d.items() if k in known})  # type: ignore[arg-type]
+
+
+@dataclass
+class Timeline:
+    """An ordered set of files presented as one continuous recording.
+
+    A single file is just a timeline of length one, so the pipeline has exactly
+    one code path rather than a special case for the common input.
+    """
+
+    sources: List[Source]
+
+    @classmethod
+    def build(cls, paths: Iterable[str]) -> "Timeline":
+        """Probe each file's duration and lay them out end to end, in order.
+
+        Order is taken as given — the caller is responsible for passing files
+        in chronological order, since filesystem order is not reliably
+        chronological and mtime is destroyed by copying.
+        """
+        sources: List[Source] = []
+        cursor = 0.0
+        for i, p in enumerate(paths):
+            dur = get_duration_sec(p)
+            sources.append(Source(
+                path=os.path.abspath(p), index=i,
+                duration_sec=dur, time_offset=cursor,
+            ))
+            cursor += dur
+        if not sources:
+            raise ValueError("a timeline needs at least one source file")
+        return cls(sources=sources)
+
+    def __len__(self) -> int:
+        return len(self.sources)
+
+    @property
+    def is_multi(self) -> bool:
+        return len(self.sources) > 1
+
+    @property
+    def duration_sec(self) -> float:
+        return sum(s.duration_sec for s in self.sources)
+
+    @property
+    def first_path(self) -> str:
+        return self.sources[0].path
+
+    def source_for_frame(self, global_frame: int) -> Optional[Source]:
+        for s in self.sources:
+            if s.frame_offset <= global_frame < s.frame_offset + s.frame_span:
+                return s
+        return None
+
+    def local_frame(self, global_frame: int) -> Optional[Tuple[Source, int]]:
+        """Map a global frame index back to (source, local frame index)."""
+        s = self.source_for_frame(global_frame)
+        return None if s is None else (s, global_frame - s.frame_offset)
+
+    def source_for_time(self, global_time: float) -> Source:
+        """Map a global timestamp to the source that contains it.
+
+        Clamps rather than failing: a timestamp exactly at the end of the last
+        file is a legitimate event end time.
+        """
+        for s in self.sources:
+            if s.time_offset <= global_time < s.end_time:
+                return s
+        return self.sources[-1] if global_time >= 0 else self.sources[0]
+
+    def local_time(self, global_time: float) -> Tuple[Source, float]:
+        """Map a global timestamp to (source, seconds into that file)."""
+        s = self.source_for_time(global_time)
+        return s, max(0.0, global_time - s.time_offset)
+
+    def to_dicts(self) -> List[Dict[str, object]]:
+        return [s.to_dict() for s in self.sources]
+
+    @classmethod
+    def from_dicts(cls, ds: Iterable[Dict[str, object]]) -> "Timeline":
+        return cls(sources=[Source.from_dict(d) for d in ds])
+
+
+def iter_timeline_frames(
+    timeline: Timeline,
+    interval_sec: float = 1.0,
+) -> Iterator[Tuple[SampledFrame, Source]]:
+    """Stream every source in order as one continuous sampled timeline.
+
+    Yields ``(frame, source)`` where the frame's `frame_idx` and `time_sec`
+    have already been shifted into global coordinates, so downstream code that
+    only understands "one long video" needs no changes at all.
+
+    Offsets are assigned *during* iteration rather than up front, from each
+    file's last observed sample time. Container-reported duration is used as a
+    floor, not as the truth: some screen recorders under-report it, and taking
+    it at face value would make later files overlap earlier ones and produce
+    non-monotonic timestamps.
+    """
+    frame_cursor = 0
+    time_cursor = 0.0
+
+    for src in timeline.sources:
+        src.frame_offset = frame_cursor
+        src.time_offset = time_cursor
+
+        last_local_frame = -1
+        last_local_time = 0.0
+
+        for sf in iter_sampled_frames(src.path, interval_sec=interval_sec):
+            last_local_frame = sf.frame_idx
+            last_local_time = sf.time_sec
+            yield (
+                SampledFrame(
+                    frame_idx=src.frame_offset + sf.frame_idx,
+                    pts=sf.pts,
+                    time_sec=src.time_offset + sf.time_sec,
+                    image=sf.image,
+                ),
+                src,
+            )
+
+        src.frame_span = last_local_frame + 1
+        # The file extends at least to its last sampled frame; keep whichever
+        # of that and the container's claim is larger.
+        src.duration_sec = max(src.duration_sec, last_local_time)
+        frame_cursor = src.frame_offset + src.frame_span
+        time_cursor = src.time_offset + src.duration_sec
+
+
+def probe_video(video_path: str) -> Dict[str, object]:
+    """Cheap metadata read: duration, fps, resolution, codec, audio presence.
+
+    No decoding, so this stays instant even on a multi-hour file. Used by the
+    `probe` command to tell you what a run is going to cost before you start
+    one.
+    """
+    info: Dict[str, object] = {
+        "path": video_path,
+        "duration_sec": 0.0,
+        "fps": 0.0,
+        "width": 0,
+        "height": 0,
+        "codec": "?",
+        "has_audio": False,
+        "error": None,
+    }
+    try:
+        container = av.open(video_path)
+    except Exception as exc:
+        info["error"] = str(exc)
+        return info
+    try:
+        if container.duration is not None:
+            info["duration_sec"] = float(container.duration / av.time_base)
+        info["has_audio"] = len(container.streams.audio) > 0
+        if container.streams.video:
+            stream = container.streams.video[0]
+            rate = stream.average_rate or stream.base_rate
+            info["fps"] = float(rate) if rate else 0.0
+            info["width"] = int(stream.codec_context.width or 0)
+            info["height"] = int(stream.codec_context.height or 0)
+            info["codec"] = stream.codec_context.name or "?"
+            if not info["duration_sec"] and stream.duration and stream.time_base:
+                info["duration_sec"] = float(stream.duration * stream.time_base)
+    finally:
+        container.close()
+    return info
+
+
 def decode_frames_at(
     video_path: str, indices: Iterable[int]
 ) -> Dict[int, np.ndarray]:
@@ -278,28 +506,34 @@ def resize_long_edge(img: np.ndarray, long_edge: int) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    # Standalone debug: print metadata and sample a few frames.
+    # Standalone debug: print metadata and walk the timeline.
     import sys
     import time
 
     if len(sys.argv) < 2:
-        print("usage: python -m cuts.media <video_path> [interval_sec]")
+        print("usage: python -m cuts.media <video_path> [more_videos...]")
         sys.exit(1)
-    path = sys.argv[1]
-    interval = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    paths = sys.argv[1:]
 
-    print(f"video:    {path}")
-    print(f"fps:      {get_fps(path):.4f}")
-    print(f"duration: {get_duration_sec(path):.2f}s")
-    print(f"audio:    {has_audio(path)}")
+    for p in paths:
+        meta = probe_video(p)
+        print(f"{os.path.basename(p)}: {meta['duration_sec']:.1f}s "
+              f"{meta['width']}x{meta['height']} @{meta['fps']:.2f}fps "
+              f"{meta['codec']} audio={meta['has_audio']}")
+
+    tl = Timeline.build(paths)
+    print(f"\ntimeline: {len(tl)} source(s), {tl.duration_sec:.1f}s total")
 
     t0 = time.time()
     n = 0
     last_t = 0.0
-    for sf in iter_sampled_frames(path, interval_sec=interval):
-        if n < 5:
-            print(f"  sample {n}: frame={sf.frame_idx} t={sf.time_sec:.3f}s "
-                  f"shape={sf.image.shape}")
+    for sf, src in iter_timeline_frames(tl, interval_sec=1.0):
+        if n < 3:
+            print(f"  sample {n}: global_frame={sf.frame_idx} "
+                  f"t={sf.time_sec:.3f}s from {src.name} shape={sf.image.shape}")
         last_t = sf.time_sec
         n += 1
     print(f"sampled {n} frames (last t={last_t:.2f}s) in {time.time() - t0:.2f}s")
+    for s in tl.sources:
+        print(f"  {s.name}: t+{s.time_offset:.1f}s frames "
+              f"[{s.frame_offset}, {s.frame_offset + s.frame_span})")

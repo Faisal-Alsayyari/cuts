@@ -15,7 +15,8 @@ Point it at a multi-hour screen recording and get back a chapter list:
 
 The primary target is screen captures of coding sessions, where the hard part
 is not finding visual cuts — there usually aren't any — but finding the points
-where *what the person is doing* changes.
+where *what the person is doing* changes. Input can be one file or a session
+split across several days' worth of them.
 
 ## Install
 
@@ -34,6 +35,7 @@ crude keyword-derived titles.
 ## Run
 
 ```bash
+python -m cuts probe session.mp4                  # metadata + runtime estimate
 python -m cuts chapters session.mp4
 python -m cuts chapters session.mp4 --chapters 12 --ocr-stride 3 -v
 python -m cuts label session.events.json          # re-title without re-analyzing
@@ -45,6 +47,44 @@ Useful flags: `--interval` (sampling rate), `--chapters` (target count),
 
 Each run writes `<video>.events.json` — the full index, including per-event
 OCR text, transcript, sample indices, and boundary scores.
+
+## Recordings split across several files
+
+One session captured across several days is several `.mp4`s. Pass them in
+chronological order and they are read as one continuous timeline:
+
+```bash
+python -m cuts probe day1.mp4 day2.mp4 day3.mp4      # check the order first
+python -m cuts chapters day1.mp4 day2.mp4 day3.mp4 --ocr-stride 3
+```
+
+```
+0:00    writing parser            [day1.mp4 @ 0:00]
+25:10   compiling                 [day1.mp4 @ 25:10]
+45:00   compiling                 [day2.mp4 @ 0:00]
+1:00:22 debugging segfault        [day2.mp4 @ 15:22]
+```
+
+Timestamps are global, but every chapter also carries the file it opens in and
+its offset *inside* that file, because a global timestamp is not something you
+can scrub to when the footage lives in five separate recordings.
+
+**The files are never concatenated.** A stream-copy `ffmpeg` concat requires
+every input to share a codec, resolution and pixel format, which recordings
+made on different days routinely do not; the fallback is a full re-encode —
+hours of CPU and tens of gigabytes of scratch disk before any analysis starts.
+Reading the files in sequence costs nothing extra and keeps the mapping back to
+the source.
+
+**Each file join forces a chapter boundary.** A new file means the recording
+stopped and restarted, which is a real discontinuity even when the screen looks
+identical across it — and it often does, because you left the editor open. On a
+three-file fixture whose second file deliberately opens on the same content the
+first one ended with, forcing joins recovers 7/7 ground-truth boundaries;
+`--no-join-boundaries` recovers 6/7, losing exactly that invisible join.
+
+Forced boundaries are also exempt from `--min-chapter`: a file that ends two
+seconds after its last activity change still ends there.
 
 ## How it works
 
@@ -93,7 +133,7 @@ moment matching this description" workflow.
 
 | Module | Role |
 |--------|------|
-| [cuts/media.py](cuts/media.py) | VFR-safe decoding, uniform sampling, frame lookup |
+| [cuts/media.py](cuts/media.py) | VFR-safe decoding, uniform sampling, multi-file timelines |
 | [cuts/signals/dino.py](cuts/signals/dino.py) | DINOv2 embeddings (visual channel) |
 | [cuts/signals/ocr.py](cuts/signals/ocr.py) | On-screen text (text channel) |
 | [cuts/signals/asr.py](cuts/signals/asr.py) | Whisper transcript (speech channel) |
@@ -138,7 +178,24 @@ discarded inside a single streaming pass, never accumulated.
 
 ## Status
 
-Segmentation is validated against a synthetic fixture with known ground truth
-(6/6 boundaries exact). It has **not** been validated on real devlog footage,
-and the Claude labeling path has not been run end-to-end (no credentials were
-available on the dev machine). Both are the next things to verify.
+Segmentation is validated against two synthetic fixtures with known ground
+truth:
+
+- single file, 6 activities — 6/6 boundaries exact, at `--chapters 6
+  --min-chapter 15`. At the default `--min-chapter 20` the last boundary is
+  suppressed (the final activity is 18s long) and you get 5. The floor is
+  doing what it is supposed to; the fixture is just shorter than the settings
+  assume.
+- three files, 7 activities, one join deliberately invisible to every content
+  signal — 7/7 with forced join boundaries, 6/7 without.
+
+Not yet verified:
+
+- **Real devlog footage.** Every number above comes from synthetic fixtures
+  with clean, high-contrast text. Real OCR is noisier and real activity
+  changes are more gradual.
+- **The Claude labeling path end-to-end.** No credentials were available on
+  the dev machine, so all titles shown here are the crude heuristic fallback.
+  The Claude request is written against the current API but has never run.
+- **Anything at multi-hour scale.** The largest input tested is 2m38s.
+  Runtime estimates for longer inputs are extrapolations.

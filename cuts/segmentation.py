@@ -294,6 +294,7 @@ def merge_to_target(
     n: int,
     target: int,
     config: SegmentationConfig,
+    locked: Optional[Sequence[int]] = None,
 ) -> List[int]:
     """Iteratively merge the most-similar adjacent partitions down to `target`.
 
@@ -301,8 +302,16 @@ def merge_to_target(
     than by boundary depth is what makes the result stable: a boundary can look
     sharp locally while separating two stretches that are, taken as wholes,
     the same activity.
+
+    `locked` boundaries are never merged away. They exist for structural cuts
+    the signal cannot be expected to argue for — chiefly the joins between
+    source files, which are real discontinuities in the recording no matter
+    how similar the pixels on either side happen to look. When every remaining
+    boundary is locked the merge stops early, so the target count is a goal
+    rather than a guarantee.
     """
-    bounds = sorted(set(bounds))
+    locked_set = set(locked or ())
+    bounds = sorted(set(bounds) | locked_set)
     while len(bounds) + 1 > target and bounds:
         means = _partition_means(channels, bounds, n)
         sims = _adjacent_partition_similarity(means, config)
@@ -310,30 +319,43 @@ def merge_to_target(
             break
         # sims[i] compares partition i and i+1, which are separated by
         # bounds[i]; dropping that boundary merges them.
-        bounds.pop(int(np.argmax(sims)))
+        candidates = [i for i, b in enumerate(bounds) if b not in locked_set]
+        if not candidates:
+            break
+        bounds.pop(max(candidates, key=lambda i: float(sims[i])))
     return bounds
 
 
 def _enforce_min_duration(
-    bounds: List[int], times: Sequence[float], min_sec: float, total_end: float
+    bounds: List[int],
+    times: Sequence[float],
+    min_sec: float,
+    total_end: float,
+    locked: Optional[Sequence[int]] = None,
 ) -> List[int]:
     """Drop boundaries that would create an event shorter than `min_sec`.
 
     Applied after merging so the target count is respected first. Walks left to
     right and removes any boundary too close to the previous one, which
     prevents three-second "chapters" without disturbing well-spaced ones.
+
+    `locked` boundaries survive this pass too. A file that ends two seconds
+    after its last activity change still ends there; suppressing that join to
+    satisfy a minimum length would silently stitch two recordings into one
+    chapter, which is the exact error this is meant to avoid.
     """
+    locked_set = set(locked or ())
     if min_sec <= 0 or not bounds:
         return bounds
     kept: List[int] = []
     last_start_t = times[0] if times else 0.0
     for b in sorted(bounds):
         t = times[b] if b < len(times) else total_end
-        if t - last_start_t >= min_sec:
+        if b in locked_set or t - last_start_t >= min_sec:
             kept.append(b)
             last_start_t = t
     # The final event must also clear the bar; if not, drop its opening bound.
-    if kept:
+    if kept and kept[-1] not in locked_set:
         last_t = times[kept[-1]] if kept[-1] < len(times) else total_end
         if total_end - last_t < min_sec:
             kept.pop()
@@ -366,12 +388,17 @@ def segment(
     video_id: str = "video",
     duration_sec: float = 0.0,
     verbose: bool = False,
+    forced_bounds: Optional[Sequence[int]] = None,
 ) -> List[Event]:
     """Run EFS Stage 1 and return the resulting events.
 
     Returns a single whole-video event when there is not enough signal to
     partition on (very short input, or every channel unavailable) — callers
     always get a valid, complete cover of the timeline.
+
+    `forced_bounds` are sample positions that must open a new event regardless
+    of what the signal says. The pipeline passes the source-file joins, so a
+    chapter never spans two recordings.
     """
     n = len(inp)
     if n == 0:
@@ -379,11 +406,15 @@ def segment(
 
     end_time = duration_sec or (inp.times[-1] if inp.times else 0.0)
 
+    # A forced bound at 0 is redundant (the first event starts there anyway)
+    # and one at n would open an empty trailing event.
+    locked = sorted({int(b) for b in (forced_bounds or ()) if 0 < b < n})
+
     channels = build_channels(inp, config)
     if verbose:
         print(f"  channels: {list(channels.keys()) or ['(none)']}")
     if not channels or n < 3:
-        return _events_from_bounds([], inp, video_id, end_time, None)
+        return _events_from_bounds(locked, inp, video_id, end_time, None)
 
     curves = {
         name: similarity_curve(feats, config.window_size)
@@ -393,12 +424,16 @@ def segment(
 
     minima = find_local_minima(fused)
     target = resolve_target_events(config, end_time)
+    # The locked boundaries alone already imply this many events; asking for
+    # fewer is unsatisfiable, so raise the target instead of merging forever.
+    target = max(target, len(locked) + 1)
     if verbose:
-        print(f"  local minima: {len(minima)}  ->  target events: {target}")
+        print(f"  local minima: {len(minima)}  ->  target events: {target}"
+              + (f"  ({len(locked)} locked)" if locked else ""))
 
-    bounds = merge_to_target(minima, channels, n, target, config)
+    bounds = merge_to_target(minima, channels, n, target, config, locked=locked)
     bounds = _enforce_min_duration(
-        bounds, inp.times, config.min_event_sec, end_time
+        bounds, inp.times, config.min_event_sec, end_time, locked=locked
     )
     if verbose:
         print(f"  final boundaries: {len(bounds)} -> {len(bounds) + 1} events")

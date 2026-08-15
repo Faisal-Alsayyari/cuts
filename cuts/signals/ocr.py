@@ -27,7 +27,7 @@ would need roughly 16 GB.
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -153,17 +153,28 @@ def should_ocr(sample_position: int, config: OCRConfig) -> bool:
     return sample_position % stride == 0
 
 
-def carry_forward(texts: List[Optional[str]]) -> List[str]:
+def carry_forward(
+    texts: List[Optional[str]],
+    reset_at: Optional[Sequence[int]] = None,
+) -> List[str]:
     """Fill skipped positions with the most recent OCR result.
 
     With `stride > 1` only some samples are read. Screen content persists
     between reads, so the correct fill is the last observed text rather than
     an empty string — an empty string would read as "all text vanished" and
     manufacture a boundary at every skipped frame.
+
+    `reset_at` lists positions where that assumption breaks and the carry must
+    be dropped. The pipeline passes the source-file joins: screen content does
+    *not* persist across a gap of hours between two recordings, and carrying
+    the old text over would smear the one boundary we already know is real.
     """
+    resets = set(reset_at or ())
     out: List[str] = []
     last = ""
-    for t in texts:
+    for i, t in enumerate(texts):
+        if i in resets:
+            last = ""
         if t is not None:
             last = t
         out.append(last)
