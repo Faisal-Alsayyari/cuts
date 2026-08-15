@@ -210,7 +210,24 @@ def cmd_label(args) -> int:
     return 0
 
 
+def _load_dotenv() -> None:
+    """Load ANTHROPIC_API_KEY (and friends) from a .env file if present.
+
+    Looked for in the current directory and walked upward, same as most .env
+    tooling. A real environment variable always wins over the file, so this
+    is safe to run unconditionally.
+    """
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:
+        return
+    path = find_dotenv(usecwd=True)
+    if path:
+        load_dotenv(path, override=False)
+
+
 def main(argv=None) -> int:
+    _load_dotenv()
     parser = argparse.ArgumentParser(
         prog="python -m cuts",
         description="Semantic indexing and temporal navigation of long video.",

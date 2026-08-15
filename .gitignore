@@ -14,9 +14,10 @@ venv/
 env/
 ENV/
 
-# ---- Environment / secrets (none used yet, ignored defensively) ----
+# ---- Environment / secrets ----
 .env
 .env.*
+!.env.example
 *.env
 .envrc
 

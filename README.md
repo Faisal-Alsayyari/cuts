@@ -32,6 +32,10 @@ Chapter titles need Claude API credentials — set `ANTHROPIC_API_KEY`, or run
 `ant auth login`. Without credentials the pipeline still runs and falls back to
 crude keyword-derived titles.
 
+The easiest way to set the key: `cp .env.example .env` and fill it in. The CLI
+loads `.env` automatically (see `_load_dotenv` in
+[cuts/cli.py](cuts/cli.py)); `.env` is gitignored.
+
 ## Run
 
 ```bash

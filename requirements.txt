@@ -17,6 +17,7 @@ faster-whisper
 
 # Chapter titles
 anthropic
+python-dotenv
 
 # EFS Stages 2-3 query-driven selection (cuts/select.py) — optional
 # open-clip-torch

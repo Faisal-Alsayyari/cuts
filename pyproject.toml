@@ -18,6 +18,7 @@ dependencies = [
     "rapidocr-onnxruntime",
     "faster-whisper",
     "anthropic",
+    "python-dotenv",
 ]
 
 [project.scripts]
