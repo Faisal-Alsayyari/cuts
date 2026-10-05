@@ -10,9 +10,9 @@ in `cuts.segmentation`: DINOv2 was trained on natural images, and screen
 recordings are a substantial distribution shift. Two screens showing entirely
 different source files are both "monospace text on a dark background" and can
 sit very close in DINO space, even though the semantic content changed
-completely. That is why the pipeline fuses this channel with OCR text rather
-than relying on it alone. Measure both on your own footage before assuming
-either dominates.
+completely. That is why the pipeline fuses this channel with the VLM text
+channel rather than relying on it alone. Measure both on your own footage
+before assuming either dominates.
 
 Embeddings are L2-normalized on the way out, so cosine similarity between two
 frames is a plain dot product.
@@ -190,4 +190,5 @@ if __name__ == "__main__":
         print(f"adjacent cosine: min={adj.min():.4f} mean={adj.mean():.4f} "
               f"max={adj.max():.4f}")
         print("  (a narrow range here means DINO is NOT discriminating this "
-              "footage well — expect OCR to carry the signal instead)")
+              "footage well — expect the VLM channel to carry the signal "
+              "instead)")

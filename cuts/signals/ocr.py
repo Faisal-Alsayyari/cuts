@@ -1,38 +1,53 @@
-"""Text channel — on-screen text read from sampled frames.
+"""Local OCR — grounding text for the VLM description call.
 
-For screen recordings this is usually the *strongest* semantic signal. A
-self-supervised visual model sees "monospace text on a dark background" both
-before and after the user switches from editing a parser to reading a stack
-trace; the words on screen, meanwhile, change completely. Empirically, adding
-this channel is what recovers boundaries the visual channel ranks too weakly
-to survive merging.
+Not an independent channel: `cuts.signals.vlm` is what drives segmentation
+and evidence text. This module exists solely to give that vision call exact
+strings (file names, error messages) instead of asking it to read them off a
+downscaled JPEG, which is where it goes wrong on small monospace text.
 
-Design notes carried over from the previous implementation because they
+Because it only ever runs on frames the VLM's stride already selected, there
+is no independent stride or carry-forward here — one call in, one string out.
+
+It has a second job: the engine returns a bounding box alongside every line it
+reads, and `cuts.redact` uses those boxes to black out credentials in the
+pixels before a frame is uploaded. `ocr_lines` exists for that caller;
+`ocr_image` is the same thing with the boxes discarded.
+
+Design notes carried over from the OCR-as-channel implementation because they
 measurably mattered:
 
-  * OCR runs on full-resolution decoded frames, never on re-encoded JPEG
-    thumbnails — compression artefacts materially hurt small on-screen text.
+  * OCR runs on full-resolution decoded frames, never on the resized/JPEG
+    version sent to the API — compression and downscaling artefacts
+    materially hurt small on-screen text.
   * Optional integer upscaling (2-3x, bicubic) before OCR. Strongly
-    recommended for 1080p capture where editor/terminal glyphs are small
+    recommended for 1080p+ capture where editor/terminal glyphs are small
     relative to the canvas.
   * Optional fractional ROI crops, so persistent chrome (taskbars, window
     decorations) can be excluded before OCR rather than filtered afterwards.
-
-Unlike the previous version this module is *streaming*: it exposes a
-per-image call so the pipeline can OCR each frame as it is decoded and then
-discard the pixels. Holding every sampled frame of a 45-minute 1080p capture
-would need roughly 16 GB.
 """
 
 from __future__ import annotations
 
-import os
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from ..config import OCRConfig
 
+
+@dataclass
+class OCRLine:
+    """One line of text the engine read, with where it sits in the frame.
+
+    `box` is an axis-aligned (x1, y1, x2, y2) in **original frame
+    coordinates** — the engine's own quad is in patch space, after cropping
+    and upscaling, and is mapped back by `ocr_lines`.
+    """
+
+    text: str
+    box: Tuple[int, int, int, int]
+    score: float
 
 # Lazy singleton — engine init is slow on first call (loads ONNX weights).
 _ENGINE = None
@@ -61,27 +76,39 @@ def _upscale(img: np.ndarray, factor: int) -> np.ndarray:
 
 def _apply_roi(
     img: np.ndarray, roi: Tuple[float, float, float, float]
-) -> np.ndarray:
-    """Crop a fractional (x1, y1, x2, y2) box. Degenerate boxes return the full image."""
+) -> Tuple[np.ndarray, int, int]:
+    """Crop a fractional (x1, y1, x2, y2) box, with the crop's frame offset.
+
+    Degenerate boxes return the full image — and must then report offset
+    (0, 0) rather than the box's nominal origin, or every box read from that
+    patch would be shifted by a crop that never happened.
+    """
     h, w = img.shape[:2]
     x1 = max(0, int(roi[0] * w))
     y1 = max(0, int(roi[1] * h))
     x2 = min(w, int(roi[2] * w))
     y2 = min(h, int(roi[3] * h))
     if x2 <= x1 or y2 <= y1:
-        return img
-    return img[y1:y2, x1:x2]
+        return img, 0, 0
+    return img[y1:y2, x1:x2], x1, y1
 
 
-def _prepare_patches(img: np.ndarray, config: OCRConfig) -> List[np.ndarray]:
-    """Return the upscaled patches to OCR for one frame.
+def _prepare_patches(
+    img: np.ndarray, config: OCRConfig
+) -> List[Tuple[np.ndarray, int, int]]:
+    """Return the upscaled patches to OCR, each with its frame-space offset.
 
     Upscaling is applied *after* cropping so small ROIs get the full benefit.
+    The offset is the crop's origin in the original frame; combined with
+    `upscale_factor` it is what maps a box back out of patch space.
     """
-    patches = (
-        [_apply_roi(img, box) for box in config.roi] if config.roi else [img]
+    crops: List[Tuple[np.ndarray, int, int]] = (
+        [_apply_roi(img, box) for box in config.roi]
+        if config.roi else [(img, 0, 0)]
     )
-    return [_upscale(p, config.upscale_factor) for p in patches]
+    return [
+        (_upscale(p, config.upscale_factor), ox, oy) for p, ox, oy in crops
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -89,96 +116,90 @@ def _prepare_patches(img: np.ndarray, config: OCRConfig) -> List[np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def ocr_lines(
-    img: np.ndarray, config: OCRConfig
-) -> List[Tuple[str, float]]:
-    """OCR one BGR frame; return (text, confidence) pairs above min_confidence."""
-    engine = _get_engine()
-    out: List[Tuple[str, float]] = []
-    for patch in _prepare_patches(img, config):
-        result, _ = engine(patch)
-        if not result:
-            continue
-        for row in result:
-            if len(row) < 3:
+    img: np.ndarray, config: OCRConfig, verbose: bool = False
+) -> Optional[List[OCRLine]]:
+    """OCR one BGR frame into lines, with boxes in original frame coordinates.
+
+    Returns `None` when the engine itself failed, and `[]` when it ran fine
+    and the frame genuinely has no legible text. That distinction is
+    load-bearing for `cuts.redact`: "OCR broke" must never be mistaken for
+    "there is nothing here to redact", because the first means we cannot
+    vouch for the frame and the second means we can.
+
+    Lines are returned unfiltered by duplication — dedup is a text-assembly
+    concern (see `join_lines`), and a redactor needs every box, including the
+    duplicate one an overlapping ROI produced.
+    """
+    try:
+        engine = _get_engine()
+        scale = max(1, config.upscale_factor)
+        out: List[OCRLine] = []
+        for patch, off_x, off_y in _prepare_patches(img, config):
+            result, _ = engine(patch)
+            if not result:
                 continue
-            text, score = row[1], row[2]
-            try:
-                score = float(score)
-            except (TypeError, ValueError):
-                score = 0.0
-            text = (text or "").strip()
-            if text and score >= config.min_confidence:
-                out.append((text, score))
-    return out
+            for row in result:
+                if len(row) < 3:
+                    continue
+                text, score = row[1], row[2]
+                try:
+                    score = float(score)
+                except (TypeError, ValueError):
+                    score = 0.0
+                text = (text or "").strip()
+                if not text or score < config.min_confidence:
+                    continue
+                # The engine's quad is in patch space: cropped, then upscaled.
+                # Undo both, in that order, to land back in frame coordinates.
+                pts = np.asarray(row[0], dtype=float).reshape(-1, 2)
+                xs, ys = pts[:, 0] / scale + off_x, pts[:, 1] / scale + off_y
+                out.append(OCRLine(
+                    text=text,
+                    box=(int(xs.min()), int(ys.min()),
+                         int(np.ceil(xs.max())), int(np.ceil(ys.max()))),
+                    score=score,
+                ))
+        return out
+    except Exception as exc:
+        if verbose:
+            print(f"  [ocr] grounding failed: {exc!r}")
+        return None
 
 
-def ocr_image(img: np.ndarray, config: OCRConfig) -> str:
-    """OCR one BGR frame and return its text as newline-joined lines.
+def join_lines(lines: List[OCRLine], config: OCRConfig) -> str:
+    """Render OCR lines into the grounding string handed to the VLM call.
 
-    Duplicate lines within a single frame are collapsed (OCR often reports the
-    same string from overlapping ROI crops), preserving first-seen order.
+    Duplicate lines within a single frame are collapsed (OCR often reports
+    the same string from overlapping ROI crops), preserving first-seen order.
+    The joined result is capped at `config.max_chars` — this is a grounding
+    hint for a one-sentence description, not a transcript, so a dense screen
+    does not need to be passed through in full.
     """
     seen = set()
     kept: List[str] = []
-    for text, _score in ocr_lines(img, config):
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(text)
-    return "\n".join(kept)
+    for line in lines:
+        key = line.text.lower()
+        if key and key not in seen:
+            seen.add(key)
+            kept.append(line.text)
+    text = "\n".join(kept)
+    if config.max_chars > 0 and len(text) > config.max_chars:
+        text = text[: config.max_chars]
+    return text
 
 
-def save_debug_png(
-    img: np.ndarray, config: OCRConfig, out_dir: str, name: str
-) -> None:
-    """Write the exact patches fed to OCR, for visual inspection of failures."""
-    import cv2
-    os.makedirs(out_dir, exist_ok=True)
-    for ri, patch in enumerate(_prepare_patches(img, config)):
-        cv2.imwrite(os.path.join(out_dir, f"{name}_roi{ri}.png"), patch)
+def ocr_image(img: np.ndarray, config: OCRConfig, verbose: bool = False) -> str:
+    """OCR one BGR frame and return its text as newline-joined lines.
 
+    Returns "" on any engine failure rather than raising: this is a
+    best-effort hint for the VLM call, not a required input, and one bad
+    frame should not abort a run that would otherwise complete fine.
 
-# ---------------------------------------------------------------------------
-# Stride handling
-# ---------------------------------------------------------------------------
-
-def should_ocr(sample_position: int, config: OCRConfig) -> bool:
-    """Whether the sample at this position should be OCR'd, given the stride.
-
-    OCR is by far the slowest per-frame signal, so `stride > 1` lets callers
-    trade text resolution for wall time.
+    Callers that upload the frame should use `cuts.redact.scrub_frame`
+    instead — it needs the boxes this discards.
     """
-    stride = max(1, config.stride)
-    return sample_position % stride == 0
-
-
-def carry_forward(
-    texts: List[Optional[str]],
-    reset_at: Optional[Sequence[int]] = None,
-) -> List[str]:
-    """Fill skipped positions with the most recent OCR result.
-
-    With `stride > 1` only some samples are read. Screen content persists
-    between reads, so the correct fill is the last observed text rather than
-    an empty string — an empty string would read as "all text vanished" and
-    manufacture a boundary at every skipped frame.
-
-    `reset_at` lists positions where that assumption breaks and the carry must
-    be dropped. The pipeline passes the source-file joins: screen content does
-    *not* persist across a gap of hours between two recordings, and carrying
-    the old text over would smear the one boundary we already know is real.
-    """
-    resets = set(reset_at or ())
-    out: List[str] = []
-    last = ""
-    for i, t in enumerate(texts):
-        if i in resets:
-            last = ""
-        if t is not None:
-            last = t
-        out.append(last)
-    return out
+    lines = ocr_lines(img, config, verbose=verbose)
+    return join_lines(lines, config) if lines else ""
 
 
 if __name__ == "__main__":
@@ -193,12 +214,12 @@ if __name__ == "__main__":
         print("usage: python -m cuts.signals.ocr <video_path> [interval_sec]")
         sys.exit(1)
     cfg = CutsConfig()
-    interval = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
+    interval = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
 
     t0 = time.time()
     for i, sf in enumerate(iter_sampled_frames(sys.argv[1], interval_sec=interval)):
         t1 = time.time()
-        text = ocr_image(sf.image, cfg.ocr)
+        text = ocr_image(sf.image, cfg.ocr, verbose=True)
         lines = text.split("\n") if text else []
         print(f"\n[t={sf.time_sec:6.1f}s] {len(lines)} lines "
               f"({time.time() - t1:.2f}s)")

@@ -1,15 +1,17 @@
 """Turn per-sample text into L2-normalized vectors for similarity comparison.
 
-Both the OCR and ASR channels produce a string per sampled frame. To feed them
+Both the VLM and ASR channels produce a string per sampled frame. To feed them
 into the same temporal-similarity machinery as DINOv2 embeddings, each string
 becomes a vector whose cosine similarity with its neighbours is meaningful.
 
 We use TF-IDF rather than raw term frequency, and the IDF term is doing real
 work in this domain: a screen recording has persistent chrome — menu bars,
-status lines, the editor's own filename tabs — whose text appears in nearly
-every frame. Under plain TF that constant text dominates the similarity and
-flattens the curve. IDF drives those ubiquitous tokens toward zero weight so
-similarity is decided by the text that actually changes.
+status lines, the editor's own filename tabs — that a description can end up
+mentioning in nearly every frame, and a scene-setting phrase a VLM tends to
+repeat verbatim ("a code editor is open") is no different in effect. Under
+plain TF that constant text dominates the similarity and flattens the curve.
+IDF drives those ubiquitous tokens toward zero weight so similarity is decided
+by the text that actually changes.
 
 Vocabulary is capped (`max_vocab`) so a multi-hour video cannot blow up memory
 with a vector per sample over a hundred-thousand-token vocabulary.
@@ -31,8 +33,10 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 def tokenize(text: str) -> List[str]:
     """Alnum/underscore tokenizer, lowercased.
 
-    Lowercasing matters because OCR frequently returns SHOUTY UI TEXT for the
-    same words it reads normally elsewhere.
+    Lowercasing matters because case is not a meaningful signal here — a VLM
+    describing the same file name or term should not be treated as saying
+    something different because of capitalization, and it keeps behaviour
+    consistent for anything still feeding this from raw OCR text.
     """
     return [t.lower() for t in _TOKEN_RE.findall(text or "")]
 

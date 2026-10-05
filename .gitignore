@@ -42,3 +42,12 @@ Thumbs.db
 
 # ---- Generated index files ----
 *.events.json
+
+# Pass 1 output. Worth ignoring on its own terms, not just as build output:
+# every observation carries the OCR text read off the screen at that instant,
+# so this is a running transcript of whatever was captured. Credentials in it
+# have been through cuts.redact, but that reduces exposure rather than
+# guaranteeing it (see cuts/redact.py), and the rest is still your screen.
+*.observations.jsonl
+
+Thoughts

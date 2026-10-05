@@ -1,13 +1,21 @@
 """On-disk schema for semantic video indexes.
 
-An `Event` is the atomic unit produced by segmentation: a contiguous span of
-video that is internally homogeneous in what the user was doing. A `Chapter`
-is an `Event` that has been given a human-readable title.
+An `Event` is a contiguous span of video that is internally homogeneous in
+what the user was doing — either as `cuts.coalesce` judged it, or as
+`cuts.segmentation` computed it. A `Chapter` is an `Event` that has been given
+a human-readable title. Note that an `Event` is *not* the unit Pass 1
+produces: that is an `Observation` (`cuts.observe`), a single timestamped
+frame. One event coalesces one or more observations.
 
-Frame indices AND time-seconds are both stored because:
-  - frame indices are the canonical identifier (VFR-safe, decode-order),
-  - time-seconds are what a chapter list actually displays and what transcript
-    overlap is computed against.
+**Time is the canonical identifier.** Frame indices are still recorded when
+they are known, but they are advisory. Seek-based sampling reaches a frame by
+timestamp and never assigns it an ordinal (`media.iter_frames_at_times` sets
+`frame_idx = -1` deliberately), so an index is not something every event has —
+whereas a timestamp is what the chapter list displays, what transcript overlap
+is computed against, and what you need to open the footage.
+
+Both are still stored, because frame indices remain the VFR-safe way to name a
+frame *within a sequential decode*, which the `--segmenter curve` path does.
 
 A recording may be split across several files (one per day, say). Those are
 analyzed as a single continuous timeline, so `start_time` is always global —
@@ -47,25 +55,39 @@ class Event:
         on the format.
     start_frame, end_frame:
         Inclusive ordinal frame indices (decode order, matching
-        `media.SampledFrame.frame_idx`).
+        `media.SampledFrame.frame_idx`), or -1 when unknown. Advisory: see
+        `sample_times` below.
     start_time, end_time:
         Seconds from video start, computed from ``pts * time_base`` — never
-        from ``frame_idx / fps``.
+        from ``frame_idx / fps``. **These identify the event**; everything
+        downstream (opening the footage, re-decoding a frame, rendering the
+        chapter list) works from them.
     title:
         Human-readable chapter label ("debugging segfault"). Empty until
         `cuts.labeling` has run.
     summary:
         Optional longer description, when the labeler produced one.
-    ocr_text:
-        Deduplicated on-screen text observed across this event's samples.
+    vlm_text:
+        Deduplicated per-frame screen descriptions observed across this
+        event's samples (see cuts.signals.vlm).
     transcript_text:
         Speech transcribed within this event's time window. Empty when the
         source had no audio or ASR was disabled.
+    sample_times:
+        Global timestamps of the samples inside this event. **This is the
+        canonical membership record.** Seek-based sampling (`cuts.observe`)
+        reaches a frame by timestamp and never assigns it an ordinal, so time
+        is the only identifier that always exists.
     sample_indices:
-        Frame indices of the sampled frames that fall inside this event.
+        Frame indices of those same samples — advisory. Populated by the
+        `curve` path, which decodes sequentially and therefore knows the
+        ordinal; empty under the `llm` path.
+    representative_times:
+        Global timestamps chosen to stand in for the event (thumbnails,
+        vision-based labeling). Preferred over `representative_frames`.
     representative_frames:
-        Frame indices chosen to stand in for the event (for thumbnails and
-        for vision-based labeling).
+        The same choices as frame indices — advisory, on the same terms as
+        `sample_indices`.
     source_path, source_index, source_start_time:
         Which input file this event opens in, and how far into that file it
         starts. For a single-file input these are just the video itself and
@@ -87,9 +109,11 @@ class Event:
     end_time: float
     title: str = ""
     summary: str = ""
-    ocr_text: str = ""
+    vlm_text: str = ""
     transcript_text: str = ""
+    sample_times: List[float] = field(default_factory=list)
     sample_indices: List[int] = field(default_factory=list)
+    representative_times: List[float] = field(default_factory=list)
     representative_frames: List[int] = field(default_factory=list)
     source_path: str = ""
     source_index: int = 0
@@ -113,12 +137,13 @@ class Event:
     def combined_text(self) -> str:
         """Text used for keyword / embedding indexing.
 
-        OCR and transcript are joined with a double space so tokenizers see
-        them as distinct fields without inventing a separator token.
+        Screen description and transcript are joined with a double space so
+        tokenizers see them as distinct fields without inventing a separator
+        token.
         """
-        if self.ocr_text and self.transcript_text:
-            return f"{self.ocr_text}  {self.transcript_text}"
-        return self.ocr_text or self.transcript_text
+        if self.vlm_text and self.transcript_text:
+            return f"{self.vlm_text}  {self.transcript_text}"
+        return self.vlm_text or self.transcript_text
 
     def timestamp(self) -> str:
         """Start time as ``M:SS`` (or ``H:MM:SS`` past an hour)."""

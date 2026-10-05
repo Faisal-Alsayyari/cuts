@@ -21,10 +21,10 @@ The paper's algorithm:
      the most-similar adjacent pair (cosine between their mean features) until
      exactly M events remain.
 
-Our generalization: steps 2 and 4 run per *channel* (DINOv2 embeddings, OCR
-TF-IDF vectors, transcript TF-IDF vectors) and the curves are fused. The
-paper's exact behaviour is recovered by setting `weight_dino=1.0` with the
-other weights at zero.
+Our generalization: steps 2 and 4 run per *channel* (DINOv2 embeddings, VLM
+description TF-IDF vectors, transcript TF-IDF vectors) and the curves are
+fused. The paper's exact behaviour is recovered by setting `weight_dino=1.0`
+with the other weights at zero.
 
 Why fuse at all: DINOv2 is self-supervised on natural images, and on screen
 recordings two completely different code screens are both "monospace text on a
@@ -64,14 +64,14 @@ class SegmentationInput:
     """Everything segmentation needs about the sampled frames.
 
     All sequences are parallel and ordered by time. `dino` may be None when
-    the visual channel is disabled; `ocr_texts` / `transcript_texts` may be
+    the visual channel is disabled; `vlm_texts` / `transcript_texts` may be
     None when those signals were not collected.
     """
 
     frame_indices: List[int]
     times: List[float]
     dino: Optional[np.ndarray] = None
-    ocr_texts: Optional[List[str]] = None
+    vlm_texts: Optional[List[str]] = None
     transcript_texts: Optional[List[str]] = None
 
     def __len__(self) -> int:
@@ -149,18 +149,19 @@ def build_channels(
 
     A channel is included only when it has a non-zero configured weight AND
     actually carries content. Text channels that produced no tokens at all
-    (no audio, or OCR turned up nothing) are dropped rather than contributing
-    an all-zero matrix, which would otherwise read as "everything changed".
+    (no audio, or every VLM description empty) are dropped rather than
+    contributing an all-zero matrix, which would otherwise read as
+    "everything changed".
     """
     channels: Dict[str, np.ndarray] = {}
 
     if config.weight_dino > 0 and inp.dino is not None and len(inp.dino):
         channels["dino"] = inp.dino
 
-    if config.weight_ocr > 0 and inp.ocr_texts:
-        feats = text_features(inp.ocr_texts)
+    if config.weight_vlm > 0 and inp.vlm_texts:
+        feats = text_features(inp.vlm_texts)
         if feats.shape[1] > 0 and np.any(feats):
-            channels["ocr"] = feats
+            channels["vlm"] = feats
 
     if config.weight_asr > 0 and inp.transcript_texts:
         feats = text_features(inp.transcript_texts)
@@ -183,7 +184,7 @@ def fuse_curves(
 
     weights = {
         "dino": config.weight_dino,
-        "ocr": config.weight_ocr,
+        "vlm": config.weight_vlm,
         "asr": config.weight_asr,
     }
     active = {k: max(0.0, weights.get(k, 0.0)) for k in curves}
@@ -270,7 +271,7 @@ def _adjacent_partition_similarity(
     """
     weights = {
         "dino": config.weight_dino,
-        "ocr": config.weight_ocr,
+        "vlm": config.weight_vlm,
         "asr": config.weight_asr,
     }
     active = {k: max(0.0, weights.get(k, 0.0)) for k in means}
@@ -482,7 +483,7 @@ def _events_from_bounds(
 
 if __name__ == "__main__":
     # Standalone debug: segment a video using the visual channel only, which
-    # needs no OCR/ASR setup, and print the resulting chapter skeleton.
+    # needs no VLM/ASR setup, and print the resulting chapter skeleton.
     import sys
     import time
 
@@ -498,7 +499,7 @@ if __name__ == "__main__":
     interval = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
 
     cfg = CutsConfig()
-    cfg.segmentation.weight_ocr = 0.0  # visual-only for this debug entry point
+    cfg.segmentation.weight_vlm = 0.0  # visual-only for this debug entry point
     cfg.verbose = True
 
     t0 = time.time()

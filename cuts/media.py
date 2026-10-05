@@ -13,8 +13,14 @@ What this module guarantees:
 * `iter_sampled_frames(path, interval_sec)` streams one frame every
   `interval_sec` seconds. This is the entry point for the whole semantic
   pipeline (the EFS paper's "uniformly sampled at 1 fps" candidate set).
+* `iter_frames_at_times(path, times)` decodes the frame nearest each of a list
+  of timestamps in one open, by seeking to each. This is the sampling
+  primitive for `cuts.observe` — see the performance note below for why it,
+  not `iter_sampled_frames`, is what makes sharded Pass 1 possible.
 * `decode_frames_at(path, indices)` pulls a specific set of frames in one pass,
   for representative thumbnails after segmentation has run.
+* `decode_frame_near(path, time_sec)` seeks to one arbitrary timestamp for a
+  single frame, for boundary refinement's occasional out-of-band look.
 * `Timeline` / `iter_timeline_frames` present *several* files as one continuous
   virtual timeline, which is how a session split across days is analyzed.
 
@@ -33,12 +39,26 @@ bounded number of them (see `SamplingConfig.batch_size`) and discard pixel data
 as soon as per-frame signals are extracted. Holding every sampled frame of even
 a 45-minute capture would exceed available memory on an 8 GB machine.
 
-Performance note: decoding is sequential. PyAV can only reliably seek to
-keyframes, so we decode every frame and pay `to_ndarray()` (the expensive step)
-only on sampled ones. This is correct and fast enough for hour-scale inputs,
-but it is linear in *total* video length rather than in sample count — a
-multi-hour capture is decode-bound. Keyframe-seek sampling is the known
-optimization if that becomes the bottleneck.
+Performance note: there are two sampling strategies here, and the difference
+between them is architectural rather than a micro-optimization.
+
+`iter_sampled_frames` decodes *every* frame and pays `to_ndarray()` (the
+expensive step) only on sampled ones. It is correct and simple, but its cost is
+linear in total video length rather than in sample count, and — the part that
+matters — linear in the video *before* the frames it wants. It cannot start in
+the middle.
+
+`iter_frames_at_times` seeks to each requested timestamp instead. Measured on
+an 87-minute 1080p screen capture (8.3s keyframe interval): flat at ~0.08s per
+sample whether the samples sit 5%, 50% or 95% through the file, landing within
+0.03s of the requested time. Sampling the whole file at 30s takes ~14s against
+~78s of full sequential decode, and because the cost does not grow with depth,
+independent workers can each cover their own time range. That is what
+`cuts.observe` is built on.
+
+Sequential decode remains the fallback for footage where seeking is unreliable
+(some VFR or fragmented containers), and is still what the `--segmenter curve`
+path uses.
 """
 
 from __future__ import annotations
@@ -153,6 +173,47 @@ def get_duration_sec(video_path: str) -> float:
         if stream.duration is not None and stream.time_base is not None:
             return float(stream.duration * stream.time_base)
         return 0.0
+    finally:
+        container.close()
+
+
+def true_duration_sec(
+    video_path: str, hint: Optional[float] = None, probe_sec: float = 5.0
+) -> float:
+    """Duration confirmed against the actual last frame, not just the header.
+
+    `iter_timeline_frames` treats the container's claim as a floor because some
+    screen recorders under-report it, and it can afford to: it discovers each
+    file's true extent while streaming through it. Sharded observation
+    (`cuts.observe`) never streams the whole file, so it has to establish the
+    extent up front or it would silently never sample the tail.
+
+    Cheap: seek to `probe_sec` before the claimed end and decode to EOF —
+    measured at ~0.1s on hour-long 1080p capture. Returns whichever of the
+    claim and the observed last frame is larger, so a bad seek degrades to
+    today's behaviour rather than truncating the file.
+    """
+    reported = hint if hint is not None else get_duration_sec(video_path)
+    try:
+        container = av.open(video_path)
+    except Exception:
+        return reported
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        time_base = stream.time_base
+        try:
+            container.seek(int(max(0.0, reported - probe_sec) / time_base),
+                           stream=stream, backward=True, any_frame=False)
+        except av.AVError:
+            return reported
+        last = 0.0
+        for frame in container.decode(stream):
+            pts = frame.pts if frame.pts is not None else (frame.dts or 0)
+            last = float(pts * time_base)
+        return max(reported, last)
+    except Exception:
+        return reported
     finally:
         container.close()
 
@@ -448,6 +509,134 @@ def probe_video(video_path: str) -> Dict[str, object]:
     finally:
         container.close()
     return info
+
+
+def decode_frame_near(
+    video_path: str, target_time_sec: float, search_frames: int = 500
+) -> Optional[SampledFrame]:
+    """Decode the single frame at or just after `target_time_sec`.
+
+    Used by boundary refinement (`cuts.refine`), which only ever needs a
+    handful of one-off frames at arbitrary timestamps — the streaming
+    iterators above remain the right tool for anything that touches most of
+    the video. PyAV can only seek to keyframes, so this seeks backward to the
+    nearest one and decodes forward until it passes the target time.
+
+    `frame_idx` on the returned frame is not a meaningful ordinal (this frame
+    was never part of a uniform sampling pass); only `time_sec` and `image`
+    matter to callers. Returns None if the seek or decode fails, or if no
+    frame at or after the target time turns up within `search_frames` of the
+    seek point (a defensive cap against a pathologically long keyframe gap).
+    """
+    container = av.open(video_path)
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        time_base = stream.time_base
+        target_pts = int(target_time_sec / time_base)
+        try:
+            container.seek(target_pts, stream=stream, backward=True, any_frame=False)
+        except av.AVError:
+            return None
+
+        for i, frame in enumerate(container.decode(stream)):
+            pts = frame.pts if frame.pts is not None else (frame.dts or 0)
+            t = float(pts * time_base)
+            if t + 1e-9 >= target_time_sec or i >= search_frames:
+                return SampledFrame(
+                    frame_idx=-1, pts=int(pts), time_sec=t,
+                    image=frame.to_ndarray(format="bgr24"),
+                )
+        return None
+    finally:
+        container.close()
+
+
+def iter_frames_at_times(
+    video_path: str,
+    times: Iterable[float],
+    tolerance_sec: float = 2.0,
+    resume_window_sec: float = 10.0,
+    search_frames: int = 2000,
+) -> Iterator[Tuple[float, Optional[SampledFrame]]]:
+    """Decode the frame nearest each requested timestamp, in ONE open.
+
+    This is `decode_frame_near` generalized to a whole shard's worth of
+    timestamps, and it is the sampling primitive for `cuts.observe`. Unlike
+    `iter_sampled_frames`, whose cost is linear in the video length *before*
+    the frames it wants, this pays only for the frames it actually asks for —
+    measured flat at ~0.08s per sample at 5%, 50% and 95% through an 87-minute
+    capture. That flatness is what makes shards independent: a worker covering
+    t=4900s does not decode the 4900 seconds in front of it.
+
+    Yields ``(requested_time, frame_or_None)`` in ascending time order, always
+    one pair per requested time. `None` means no frame landed within
+    `tolerance_sec` of the request — a missing observation rather than a
+    silently wrong one. Requests past the end of the stream are the ordinary
+    cause.
+
+    `resume_window_sec` is what keeps closely-spaced requests cheap: when the
+    next target is already ahead of the decode position and within one keyframe
+    interval of it, decoding continues rather than seeking again. Sparse
+    sampling (30s apart, ~8s GOPs) re-seeks every time; a dense burst — the
+    future `zoom(t0, t1, n)` tool, eight frames across thirty seconds — decodes
+    the GOP once instead of once per frame.
+
+    As everywhere else in this module, timestamps are ``pts * time_base``.
+    `frame_idx` is -1: a seeked frame has no meaningful ordinal, which is why
+    `cuts.observe` keys on time instead.
+    """
+    targets = sorted(float(t) for t in times)
+    if not targets:
+        return
+
+    container = av.open(video_path)
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        time_base = stream.time_base
+
+        decoder: Optional[Iterator] = None
+        cur_t = -1.0        # time of the last frame pulled off `decoder`
+
+        for target in targets:
+            # Re-seek unless we are already just behind the target: seeking
+            # backward to the same keyframe we are sitting inside would decode
+            # the same GOP a second time.
+            if decoder is None or not (cur_t <= target <= cur_t + resume_window_sec):
+                try:
+                    container.seek(int(target / time_base), stream=stream,
+                                   backward=True, any_frame=False)
+                except av.AVError:
+                    yield (target, None)
+                    decoder, cur_t = None, -1.0
+                    continue
+                decoder = container.decode(stream)
+                cur_t = -1.0
+
+            found: Optional[SampledFrame] = None
+            for i, frame in enumerate(decoder):
+                pts = frame.pts if frame.pts is not None else (frame.dts or 0)
+                cur_t = float(pts * time_base)
+                if cur_t + 1e-9 >= target:
+                    found = SampledFrame(
+                        frame_idx=-1, pts=int(pts), time_sec=cur_t,
+                        image=frame.to_ndarray(format="bgr24"),
+                    )
+                    break
+                if i >= search_frames:
+                    break
+
+            if found is not None and abs(found.time_sec - target) > tolerance_sec:
+                # Landed, but too far away to honestly call it this sample.
+                found = None
+            if found is None:
+                # Exhausting the decoder means end of stream; force a fresh
+                # seek for the next target rather than reusing a dead iterator.
+                decoder, cur_t = None, -1.0
+            yield (target, found)
+    finally:
+        container.close()
 
 
 def decode_frames_at(

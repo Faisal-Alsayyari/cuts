@@ -1,16 +1,18 @@
 """Turn segmented events into named chapters.
 
 Segmentation says *where* the boundaries are; this module says *what each span
-is*. Given an event's evidence — OCR text from its frames, any transcript in
-its time window, and optionally a couple of representative frames — it writes
-the short activity label a chapter list needs ("debugging segfault").
+is*. Given an event's evidence — VLM screen descriptions from its frames, any
+transcript in its time window, and optionally a couple of representative
+frames — it writes the short activity label a chapter list needs ("debugging
+segfault").
 
 Two backends:
 
   * ``claude``    — the Claude API. Best quality; needs credentials.
-  * ``heuristic`` — dominant-OCR-term extraction. No dependencies, no network,
-    much cruder labels. It exists so the pipeline produces a complete result
-    without credentials, and so segmentation can be evaluated on its own.
+  * ``heuristic`` — dominant-term extraction over the VLM evidence text. No
+    extra dependencies, no network, much cruder labels. It exists so the
+    pipeline produces a complete result without credentials, and so
+    segmentation can be evaluated on its own.
 
 All events are labeled in a *single* Claude call by default. That is not just a
 cost optimization: seeing the whole video at once is what lets the model keep
@@ -27,8 +29,13 @@ import os
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from .config import LabelingConfig
-from .media import Timeline, decode_frames_at, resize_long_edge
+from .config import LabelingConfig, OCRConfig, RedactConfig
+from .media import (
+    Timeline,
+    decode_frames_at,
+    iter_frames_at_times,
+    resize_long_edge,
+)
 from .schema import Event, format_timestamp
 from .signals.text_features import tokenize
 
@@ -68,8 +75,9 @@ _CHAPTER_SCHEMA: Dict[str, Any] = {
 _SYSTEM = """\
 You write chapter titles for long screen recordings, usually programming \
 sessions. You are given consecutive segments of one recording; for each, you \
-see the text that was on screen (via OCR, so expect noise and broken words), \
-any spoken transcript, and sometimes a frame.
+see short descriptions of what was on screen at several points during the \
+segment (written by a vision model watching the recording), any spoken \
+transcript, and sometimes a frame.
 
 Write one title per segment describing WHAT THE PERSON WAS DOING, not what was \
 on screen. "debugging segfault" and "reading docs" are good; "terminal window" \
@@ -81,7 +89,8 @@ Rules:
 null deref") over generic ones ("coding", "working").
 - You see every segment at once: keep titles distinct from each other. If two \
 segments really are the same activity, differentiate by what changed.
-- OCR noise is expected. Infer the activity; do not quote garbled text.
+- The descriptions are a vision model's summary, not a literal transcript —
+weigh them for what they say about the activity, not as exact quotes.
 - If a segment's evidence is genuinely too thin to tell, use "unclear".
 - Return exactly one entry per segment, matching event_id."""
 
@@ -106,6 +115,22 @@ def _pick_representative(event: Event, n: int) -> List[int]:
     return [samples[min(len(samples) - 1, int(step * (k + 1)))] for k in range(n)]
 
 
+def _pick_times(event: Event, n: int) -> List[float]:
+    """`_pick_representative` on timestamps: the `llm` path's frame identifier.
+
+    `cuts.coalesce` already chose representatives when it built the event, so
+    the usual case here is just honouring them; this re-spreads only when the
+    caller wants a different count than was stored.
+    """
+    times = event.representative_times or event.sample_times
+    if not times or n <= 0:
+        return []
+    if len(times) <= n:
+        return list(times)
+    step = len(times) / (n + 1)
+    return [times[min(len(times) - 1, int(step * (k + 1)))] for k in range(n)]
+
+
 def _event_evidence(
     event: Event, config: LabelingConfig, show_source: bool = False
 ) -> str:
@@ -117,15 +142,87 @@ def _event_evidence(
     if show_source and event.source_name:
         header += f"  session: {event.source_name} @ {event.source_timestamp()}"
     parts = [header]
-    ocr = (event.ocr_text or "").strip()
-    if ocr:
-        parts.append(f"on-screen text:\n{ocr[: config.max_ocr_chars]}")
+    vlm = (event.vlm_text or "").strip()
+    if vlm:
+        parts.append(f"on-screen descriptions:\n{vlm[: config.max_vlm_chars]}")
     tr = (event.transcript_text or "").strip()
     if tr:
         parts.append(f"transcript:\n{tr[: config.max_transcript_chars]}")
-    if not ocr and not tr:
+    if not vlm and not tr:
         parts.append("(no text evidence)")
     return "\n".join(parts)
+
+
+def _decode_representatives(
+    timeline: Timeline,
+    events: Sequence[Event],
+    config: LabelingConfig,
+    verbose: bool = False,
+) -> Dict[str, List[Any]]:
+    """Decode each event's representative frames, keyed by event_id.
+
+    Events carry their representatives either as timestamps or as frame
+    indices, and which one depends on how they were produced:
+
+      * `representative_times` — the `llm` path. Frames were reached by
+        seeking, so they never had an ordinal. Decoded the same way, by
+        seeking, which also means only the wanted frames are touched.
+      * `representative_frames` — the `curve` path, which decodes sequentially
+        and therefore knows each frame's index. Decoded in one pass per file,
+        since the naive alternative is O(N x length).
+
+    Times win when an event has both. Frames are grouped by the file that owns
+    them either way, so each source is opened once rather than once per frame.
+    """
+    by_time: Dict[str, List[Tuple[str, float]]] = {}
+    by_index: Dict[str, List[Tuple[str, int]]] = {}
+    times_per_source: Dict[str, List[float]] = {}
+    idx_per_source: Dict[str, List[int]] = {}
+
+    for e in events:
+        if e.representative_times:
+            picks: List[Tuple[str, float]] = []
+            for g in _pick_times(e, config.frames_per_event):
+                src, local = timeline.local_time(g)
+                picks.append((src.path, local))
+                times_per_source.setdefault(src.path, []).append(local)
+            by_time[e.event_id] = picks
+        elif e.representative_frames or e.sample_indices:
+            picks_i: List[Tuple[str, int]] = []
+            for g in _pick_representative(e, config.frames_per_event):
+                found = timeline.local_frame(g)
+                # Single-source indexes written before frame_span was recorded,
+                # and any index outside every known span, fall back to file 0.
+                src, local = found if found else (timeline.sources[0], g)
+                picks_i.append((src.path, local))
+                idx_per_source.setdefault(src.path, []).append(local)
+            by_index[e.event_id] = picks_i
+
+    n_wanted = (sum(len(v) for v in by_time.values())
+                + sum(len(v) for v in by_index.values()))
+    if not n_wanted:
+        return {}
+    if verbose:
+        n_src = len(set(times_per_source) | set(idx_per_source))
+        print(f"  decoding {n_wanted} frames for labeling "
+              f"across {n_src} file(s)...")
+
+    decoded_t: Dict[str, Dict[float, Any]] = {
+        path: {t: (sf.image if sf else None)
+               for t, sf in iter_frames_at_times(path, ts)}
+        for path, ts in times_per_source.items()
+    }
+    decoded_i: Dict[str, Dict[int, Any]] = {
+        path: decode_frames_at(path, idxs)
+        for path, idxs in idx_per_source.items()
+    }
+
+    out: Dict[str, List[Any]] = {}
+    for eid, picks in by_time.items():
+        out[eid] = [decoded_t.get(p, {}).get(t) for p, t in picks]
+    for eid, picks_i in by_index.items():
+        out[eid] = [decoded_i.get(p, {}).get(i) for p, i in picks_i]
+    return out
 
 
 def _encode_frames(
@@ -133,61 +230,67 @@ def _encode_frames(
     events: Sequence[Event],
     config: LabelingConfig,
     verbose: bool = False,
+    ocr_config: Optional[OCRConfig] = None,
+    redact_config: Optional[RedactConfig] = None,
 ) -> Dict[str, List[str]]:
     """Decode and base64-JPEG-encode representative frames, keyed by event_id.
 
-    Frame indices are global across the timeline, so they are first grouped by
-    the file that owns them and each file is then decoded once. Decoding is a
-    sequential scan, so per-file batching is the difference between one pass
-    over each source and one pass per frame.
+    Decoding is delegated to `_decode_representatives`, which resolves an
+    event's representatives by timestamp or by frame index depending on how it
+    was produced.
+
+    These frames are decoded fresh here rather than kept from the sampling
+    pass, so they have never been through `cuts.redact` — this is an upload
+    path in its own right, and it re-runs the scrub. Doing it here rather than
+    reusing a flag from the pipeline is what keeps a standalone
+    `python -m cuts.labeling events.json` run safe too.
     """
     if config.frames_per_event <= 0:
         return {}
     import cv2
 
-    wanted: Dict[str, List[int]] = {
-        e.event_id: _pick_representative(e, config.frames_per_event) for e in events
-    }
-    all_idx = [i for idxs in wanted.values() for i in idxs]
-    if not all_idx:
+    scrub = None
+    if redact_config is not None and redact_config.enabled:
+        if ocr_config is None or not ocr_config.enabled:
+            print("[labeling] WARNING: OCR is disabled, so credential "
+                  "redaction cannot run; frames will be uploaded unredacted")
+        else:
+            from .redact import scrub_frame as scrub
+
+    wanted = _decode_representatives(timeline, events, config, verbose=verbose)
+    if not wanted:
         return {}
 
-    # global frame index -> (source path, local frame index)
-    by_source: Dict[str, List[int]] = {}
-    local_of: Dict[int, Tuple[str, int]] = {}
-    for g in all_idx:
-        found = timeline.local_frame(g)
-        if found is None:
-            # Single-source indexes written before frame_span was recorded, and
-            # any index outside every known span, fall back to the first file.
-            src, local = timeline.sources[0], g
-        else:
-            src, local = found
-        local_of[g] = (src.path, local)
-        by_source.setdefault(src.path, []).append(local)
-
-    if verbose:
-        print(f"  decoding {len(all_idx)} frames for labeling "
-              f"across {len(by_source)} file(s)...")
-
-    decoded_by_source: Dict[str, Dict[int, "object"]] = {
-        path: decode_frames_at(path, idxs) for path, idxs in by_source.items()
-    }
-
     out: Dict[str, List[str]] = {}
-    for eid, idxs in wanted.items():
+    hits_seen: List[str] = []
+    withheld = 0
+    for eid, imgs in wanted.items():
         encoded: List[str] = []
-        for g in idxs:
-            path, local = local_of[g]
-            img = decoded_by_source.get(path, {}).get(local)
+        for img in imgs:
             if img is None:
                 continue
+            if scrub is not None:
+                # Mutates img in place, so the redaction survives the resize
+                # and JPEG encode below.
+                _text, safe, hits = scrub(
+                    img, ocr_config, redact_config, verbose=verbose
+                )
+                hits_seen.extend(hits)
+                if not safe:
+                    # Drop the frame. An event left with none falls through to
+                    # text-only labeling, which is already a supported mode.
+                    withheld += 1
+                    continue
             img = resize_long_edge(img, config.frame_long_edge)
             ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 encoded.append(base64.standard_b64encode(buf.tobytes()).decode())
         if encoded:
             out[eid] = encoded
+    if hits_seen or withheld:
+        kinds = ", ".join(sorted(set(hits_seen))) or "unlocalized"
+        print(f"[redact] labeling: blacked out credentials ({kinds})"
+              + (f"; withheld {withheld} frame(s)" if withheld else ""))
     return out
 
 
@@ -305,12 +408,13 @@ _STOPWORDS = {
 
 
 def _heuristic_labels(events: Sequence[Event]) -> List[Dict[str, str]]:
-    """Label each event by its most distinctive OCR terms.
+    """Label each event by its most distinctive terms in the evidence text.
 
     Distinctive means high frequency *within* the event and low frequency
     across the rest of the video — the same intuition as the TF-IDF weighting
-    used for segmentation. Persistent UI chrome appears everywhere and is
-    therefore never chosen.
+    used for segmentation. Words that recur in every event's description
+    (persistent UI chrome, when the evidence came from OCR; generic framing
+    language, when it came from a VLM) are therefore never chosen.
     """
     per_event: List[Counter] = []
     doc_freq: Counter = Counter()
@@ -353,11 +457,18 @@ def label_events(
     backend: str = "claude",
     api_key: Optional[str] = None,
     verbose: bool = False,
+    ocr_config: Optional[OCRConfig] = None,
+    redact_config: Optional[RedactConfig] = None,
 ) -> str:
     """Set `title` on each event in place. Returns the backend actually used.
 
     `source` is the `Timeline` the events were segmented from, or a single
     video path (which is wrapped into a one-file timeline).
+
+    `ocr_config`/`redact_config` drive credential redaction on the frames sent
+    with the labeling call (see `cuts.redact`). They default to the standard
+    config rather than to "off", so a caller that forgets to pass them — the
+    standalone `__main__` path, say — still gets redaction.
 
     `backend` is "claude", "heuristic", or "auto". Under "auto" — and under
     "claude" when the call fails — labeling degrades to heuristic rather than
@@ -373,9 +484,19 @@ def label_events(
     if backend == "auto":
         backend = "claude" if have_creds else "heuristic"
 
+    # Fail safe, not open: a caller that passes neither gets redaction on with
+    # stock settings rather than silently uploading raw frames.
+    if ocr_config is None:
+        ocr_config = OCRConfig()
+    if redact_config is None:
+        redact_config = RedactConfig()
+
     if backend == "claude":
         try:
-            frames = _encode_frames(timeline, events, config, verbose=verbose)
+            frames = _encode_frames(
+                timeline, events, config, verbose=verbose,
+                ocr_config=ocr_config, redact_config=redact_config,
+            )
             content = _build_content(events, frames, config,
                                      n_sources=len(timeline))
             if verbose:

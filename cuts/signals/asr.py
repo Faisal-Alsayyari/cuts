@@ -2,7 +2,8 @@
 
 Wraps `faster-whisper`. The whole audio track is transcribed in one pass,
 producing (start_sec, end_sec, text) segments, which are then aligned onto the
-video's sample times so speech becomes a per-sample signal like OCR text.
+video's sample times so speech becomes a per-sample signal like the VLM text
+channel.
 
 Screen recordings frequently have no narration at all, so every entry point
 here degrades quietly: no audio stream, no faster-whisper installed, or ASR
