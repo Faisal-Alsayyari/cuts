@@ -57,7 +57,23 @@ class RunState:
     finished: float = 0.0
     active: bool = False
     queued: bool = False
+    # The most recent _LOG_CAP lines. `total_lines` counts every line ever
+    # added, so a viewer can tell what is new even after the front is trimmed.
     log: List[str] = field(default_factory=list)
+    total_lines: int = 0
+
+    def add_line(self, line: str) -> None:
+        self.log.append(line)
+        self.total_lines += 1
+        if len(self.log) > _LOG_CAP:
+            del self.log[: len(self.log) - _LOG_CAP]
+
+    def lines_since(self, shown: int) -> List[str]:
+        """Lines added after the first `shown` (as many as are still kept)."""
+        new = self.total_lines - shown
+        if new <= 0:
+            return []
+        return self.log[-new:] if new < len(self.log) else list(self.log)
 
     @property
     def elapsed(self) -> float:
@@ -164,7 +180,7 @@ class JobRunner(QObject):
 
         st = self.states.setdefault(job.session_id, RunState())
         st.queued, st.active, st.started = False, True, time.time()
-        st.log.append(f"$ {job.command_line}")
+        st.add_line(f"$ {job.command_line}")
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.MergedChannels)
@@ -195,7 +211,7 @@ class JobRunner(QObject):
         sid = self._current.session_id
         st = self.states[sid]
         for line in lines:
-            st.log.append(line)
+            st.add_line(line)
             sig: Optional[LogSignal] = backend.interpret(line)
             if sig is None:
                 continue
@@ -214,8 +230,6 @@ class JobRunner(QObject):
                     st.warnings.append(text)
             elif sig.kind == "error" and not st.error:
                 st.error = sig.text
-        if len(st.log) > _LOG_CAP:
-            del st.log[: len(st.log) - _LOG_CAP]
         self.updated.emit(sid)
 
     def _failed_to_start(self, err) -> None:

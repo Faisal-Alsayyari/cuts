@@ -34,20 +34,33 @@ htmlcov/
 
 # ---- Generated pipeline artifacts (recreated by running the tools) ----
 
+# The index (`cuts chapters` / `cuts coalesce`), and write_events' temp file.
+*.events.json
+.events_*.json
+
+# Pass 1 output, and the temp file it is written through. Worth ignoring on
+# its own terms, not just as build output: every observation carries the OCR
+# text read off the screen at that instant, and the header carries the speech
+# transcript, so this is a running record of whatever was captured.
+# Credentials in it have been through cuts.redact, but that reduces exposure
+# rather than guaranteeing it (see cuts/redact.py), and the rest is still
+# your screen.
+*.observations.jsonl
+*.observations.jsonl.tmp
+
+# Chapter lists saved from the GUI.
+*.chapters.txt
+
+# Output of earlier versions of the tool (shot detection, the removed search
+# index, the first refinement experiment). Kept locally, never committed.
+dummy.json
+refine_experiment/
+retrieval_index/
+
 # ---- OS / editor cruft ----
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
-# ---- Generated index files ----
-*.events.json
-
-# Pass 1 output. Worth ignoring on its own terms, not just as build output:
-# every observation carries the OCR text read off the screen at that instant,
-# so this is a running transcript of whatever was captured. Credentials in it
-# have been through cuts.redact, but that reduces exposure rather than
-# guaranteeing it (see cuts/redact.py), and the rest is still your screen.
-*.observations.jsonl
 
 Thoughts

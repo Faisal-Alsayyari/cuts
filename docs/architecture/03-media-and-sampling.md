@@ -1,5 +1,7 @@
 # 03 — Media: decoding, sampling, and the multi-file timeline
 
+> **Pre-refactor.** This document describes the code at `c39a118`. The pipeline was since unified on branch `refactor/unify-pipeline`; see [12-unified-pipeline.md](12-unified-pipeline.md) for what changed.
+
 All decoding goes through PyAV in `cuts/media.py`. The module's rule is that
 timestamps are always `pts * time_base` (VFR-safe), never `frame_idx / fps`.
 Images are `HxWx3` **BGR** `uint8` ndarrays (`frame.to_ndarray(format="bgr24")`)

@@ -1,32 +1,28 @@
 """Text channel — per-frame screen descriptions from a Claude vision call.
 
-Replaces local OCR as the text channel. Instead of transcribing every visible
-string (noisy, and a wall of text that is not actually the deliverable),
-a small vision model writes a short factual description of what's on screen.
-That description does double duty: fed through the same TF-IDF machinery as
-the old OCR text, it drives the fused similarity curve in `cuts.segmentation`
-exactly as before, and it is also what gets stored as event evidence — so the
-index holds a description, not a transcript.
-
-There is no "is this frame different enough to bother describing" decision
-step: that call would cost the same API round-trip as just describing the
-frame, so the segmentation math (which already exists for this) decides
-sameness from the descriptions rather than an LLM deciding it up front.
+A small vision model writes one short factual sentence per sampled frame,
+grounded by exact strings from local OCR (`cuts.signals.ocr`). Those
+descriptions are the evidence Pass 2 reads (`cuts.coalesce`), the text channel
+of the curve segmenter (`cuts.segmentation`, via TF-IDF), and what is stored
+per chapter in the index.
 
 **Several frames go in one call** (`VLMConfig.frames_per_call`). That is
 cheaper — the system prompt is sent once per call rather than once per frame —
 and it lets the model see each frame's neighbours, which it uses to work out
 *what it is looking at*. It must never refer to them in the output: every
-description has to stand alone, because `cuts.segmentation` compares
+description has to stand alone, because the curve segmenter compares
 consecutive descriptions by TF-IDF cosine, and "same as the previous frame"
 shares almost no tokens with a description that names the file, which reads
 as a large change and manufactures a boundary that isn't there. Repeating a
-neighbour's wording verbatim when nothing changed is the *correct* output:
-cosine ≈ 1.0, meaning no change.
+neighbour's wording verbatim when nothing changed is the *correct* output.
 
-Description calls are network-latency-bound, not compute-bound, so
-`describe_batch` fires the chunks concurrently rather than one at a time, and
-`cuts.pipeline` submits them without waiting so decoding overlaps the network.
+Because the prompt tells the model its frames are consecutive, callers whose
+frames are *not* neighbours (boundary refinement's midpoints) must send them
+one per call.
+
+A failed call yields `None` for its frames, never "", so "the model was not
+reached" stays distinguishable from "the model said nothing" — the observation
+cache records the former as `failed` and retries it on the next run.
 
 `decide_refinement` is a second, distinct kind of call used by `cuts.refine`:
 given descriptions of the frames on either side of a detected boundary plus
@@ -37,13 +33,13 @@ transition falls in.
 from __future__ import annotations
 
 import base64
-import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from ..config import RefineConfig, VLMConfig
+from .. import llm
+from ..config import VLMConfig
 
 _DESCRIBE_SYSTEM = """\
 You are scouting footage from a screen-recorded coding session to help index \
@@ -138,21 +134,12 @@ _REFINE_SCHEMA = {
 }
 
 
-def _client(api_key: Optional[str] = None):
-    import anthropic
-
-    # A bare constructor also resolves an `ant auth login` profile, so do not
-    # require an explicit key.
-    return anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-
-
 def encode_frame(img: np.ndarray, quality: int = 85) -> str:
     """Encode one BGR frame as a base64 JPEG string, ready to send.
 
-    Public because the pipeline calls it in its own decode loop rather than
-    letting the API threads do it: an encoded frame is roughly 15x smaller
-    than the numpy array it came from, and with calls submitted without
-    waiting, whatever is in flight is held in memory until its call returns.
+    Encoding happens in the decode loop rather than on an API thread: an
+    encoded frame is roughly 15x smaller than the numpy array it came from,
+    so pending uploads stay small.
 
     The caller is responsible for resizing first (`VLMConfig.frame_long_edge`).
     """
@@ -185,21 +172,18 @@ def describe_frames(
     encoded: Sequence[str],
     config: VLMConfig,
     ocr_texts: Optional[Sequence[str]] = None,
-    api_key: Optional[str] = None,
     verbose: bool = False,
-) -> List[str]:
+) -> List[Optional[str]]:
     """ONE Claude vision call describing several consecutive frames.
 
     `encoded` holds base64 JPEG strings from `encode_frame`, in chronological
     order. `ocr_texts`, when given, must be the same length — "" for a frame
     with no grounding text.
 
-    Always returns exactly `len(encoded)` descriptions, in order. A frame the
-    model omits (or a call that fails outright) yields "" for that frame
-    rather than raising or shifting the rest: an empty description is a zero
-    TF-IDF row that contributes no opinion to the similarity curve, which is
-    a far better failure mode than a misaligned sequence, where every
-    subsequent description would be attributed to the wrong moment.
+    Always returns exactly `len(encoded)` entries, in order, so a missing
+    entry can never shift the rest onto the wrong moment. An entry is `None`
+    when that frame got no description: the call failed outright, or the
+    model omitted that frame or returned an empty sentence for it.
     """
     n = len(encoded)
     if n == 0:
@@ -228,83 +212,45 @@ def describe_frames(
         })
 
     try:
-        client = _client(api_key)
-        response = client.messages.create(
+        data = llm.structured_call(
             model=config.model,
+            system=_DESCRIBE_SYSTEM,
+            content=content,
+            schema=_DESCRIBE_SCHEMA,
             # Derived from the batch size so a larger frames_per_call cannot
             # silently truncate the tail of the response; the slack covers
             # the JSON scaffolding around the descriptions themselves.
             max_tokens=config.max_tokens_per_frame * n + 200,
-            system=_DESCRIBE_SYSTEM,
-            messages=[{"role": "user", "content": content}],
-            output_config={
-                "format": {"type": "json_schema", "schema": _DESCRIBE_SCHEMA},
-            },
         )
-    except Exception as exc:
-        if verbose:
-            print(f"  [vlm] describe failed for {n} frame(s): {exc!r}")
-        return [""] * n
-
-    text = next((b.text for b in response.content if b.type == "text"), "")
-    if not text:
-        return [""] * n
-    try:
-        entries = json.loads(text).get("descriptions", [])
-    except json.JSONDecodeError:
-        if verbose:
-            print(f"  [vlm] unparseable description response for {n} frame(s)")
-        return [""] * n
+    except llm.LLMError as exc:
+        print(f"  [vlm] describe failed for {n} frame(s): {exc}")
+        return [None] * n
 
     by_frame: Dict[int, str] = {}
-    for entry in entries:
+    for entry in data.get("descriptions", []) or []:
         try:
             idx = int(entry["frame"])
         except (KeyError, TypeError, ValueError):
             continue
-        if 0 <= idx < n:
-            by_frame[idx] = _trim_words(str(entry.get("description", "")).strip())
+        desc = _trim_words(str(entry.get("description", "")).strip())
+        if 0 <= idx < n and desc:
+            by_frame[idx] = desc
     if verbose and len(by_frame) != n:
         print(f"  [vlm] got {len(by_frame)}/{n} descriptions in one response")
-    return [by_frame.get(i, "") for i in range(n)]
-
-
-def describe_image(
-    img: np.ndarray,
-    config: VLMConfig,
-    ocr_text: str = "",
-    api_key: Optional[str] = None,
-    verbose: bool = False,
-) -> str:
-    """Describe a single frame. Thin wrapper over `describe_frames`.
-
-    Used for one-off frames outside the main sampling pass — chiefly the
-    midpoint frame in `cuts.refine`.
-    """
-    out = describe_frames(
-        [encode_frame(img)], config, ocr_texts=[ocr_text],
-        api_key=api_key, verbose=verbose,
-    )
-    return out[0] if out else ""
+    return [by_frame.get(i) for i in range(n)]
 
 
 def describe_batch(
     encoded: Sequence[str],
     config: VLMConfig,
     ocr_texts: Optional[Sequence[str]] = None,
-    api_key: Optional[str] = None,
     verbose: bool = False,
-) -> List[str]:
-    """Describe many frames, chunked into calls and run concurrently.
+) -> List[Optional[str]]:
+    """Describe many frames, chunked into calls of `frames_per_call`.
 
-    Splits `encoded` into groups of `config.frames_per_call`, sends each group
-    as one call, and runs the calls concurrently — description calls are
-    network-latency-bound, so serial round trips would dominate wall time.
-    Results are flattened back into input order.
-
-    `cuts.pipeline` does not use this on its main path (it submits chunks
-    itself so decoding can proceed without waiting); this is for callers that
-    have all their frames up front, such as `cuts.refine`.
+    Chunks run concurrently; how many requests are actually in flight is
+    bounded globally by `cuts.llm`, not here. Results come back flattened in
+    input order, `None` where a frame got no description.
     """
     n = len(encoded)
     if n == 0:
@@ -314,46 +260,14 @@ def describe_batch(
     chunks = [
         (encoded[i:i + size], texts[i:i + size]) for i in range(0, n, size)
     ]
-    with ThreadPoolExecutor(max_workers=max(1, config.concurrency)) as pool:
+    if len(chunks) == 1:
+        return describe_frames(chunks[0][0], config, chunks[0][1], verbose)
+    with ThreadPoolExecutor(max_workers=min(len(chunks), 16)) as pool:
         results = list(pool.map(
-            lambda ch: describe_frames(
-                ch[0], config, ocr_texts=ch[1],
-                api_key=api_key, verbose=verbose,
-            ),
+            lambda ch: describe_frames(ch[0], config, ch[1], verbose),
             chunks,
         ))
     return [d for chunk in results for d in chunk]
-
-
-# ---------------------------------------------------------------------------
-# Stride handling / carry-forward (unchanged semantics from local OCR)
-# ---------------------------------------------------------------------------
-
-def carry_forward(
-    texts: List[Optional[str]],
-    reset_at: Optional[Sequence[int]] = None,
-) -> List[str]:
-    """Fill skipped positions with the most recent description.
-
-    With `stride > 1` only some samples are described. Screen content
-    persists between reads, so the correct fill is the last observed
-    description rather than an empty string, which would read as "everything
-    on screen vanished" and manufacture a boundary at every skipped frame.
-
-    `reset_at` lists positions where that assumption breaks and the carry
-    must be dropped. The pipeline passes the source-file joins: screen
-    content does not persist across a gap of hours between two recordings.
-    """
-    resets = set(reset_at or ())
-    out: List[str] = []
-    last = ""
-    for i, t in enumerate(texts):
-        if i in resets:
-            last = ""
-        if t is not None:
-            last = t
-        out.append(last)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -364,16 +278,14 @@ def decide_refinement(
     desc_before: str,
     desc_mid: str,
     desc_after: str,
-    config: RefineConfig,
-    vlm_model: str,
-    api_key: Optional[str] = None,
+    model: str,
+    max_tokens: int,
     verbose: bool = False,
 ) -> str:
     """Classify which half of a sampling gap a transition falls in.
 
-    Returns "first_half", "second_half", or "unclear" (treated by the caller
-    the same as "second_half": keep the original boundary rather than move
-    it on a low-confidence guess).
+    Returns "first_half", "second_half", or "unclear". Anything that goes
+    wrong is "unclear", which the caller treats as "keep the boundary".
     """
     prompt = (
         f"A: {desc_before or '(no evidence)'}\n"
@@ -381,28 +293,16 @@ def decide_refinement(
         f"B: {desc_after or '(no evidence)'}"
     )
     try:
-        client = _client(api_key)
-        response = client.messages.create(
-            model=config.model or vlm_model,
-            max_tokens=config.max_tokens,
-            system=_REFINE_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={
-                "format": {"type": "json_schema", "schema": _REFINE_SCHEMA},
-            },
+        data = llm.structured_call(
+            model=model, system=_REFINE_SYSTEM, content=prompt,
+            schema=_REFINE_SCHEMA, max_tokens=max_tokens,
         )
-    except Exception as exc:
+    except llm.LLMError as exc:
         if verbose:
-            print(f"  [refine] decision failed: {exc!r}")
+            print(f"  [refine] decision failed: {exc}")
         return "unclear"
-
-    text = next((b.text for b in response.content if b.type == "text"), "")
-    if not text:
-        return "unclear"
-    try:
-        return json.loads(text).get("transition", "unclear")
-    except json.JSONDecodeError:
-        return "unclear"
+    transition = data.get("transition")
+    return transition if transition in ("first_half", "second_half") else "unclear"
 
 
 if __name__ == "__main__":
@@ -414,6 +314,10 @@ if __name__ == "__main__":
     from ..config import CutsConfig
     from ..media import iter_sampled_frames, resize_long_edge
     from .ocr import ocr_image
+
+    if not llm.has_credentials():
+        print("no Anthropic credentials found")
+        sys.exit(2)
 
     if len(sys.argv) < 2:
         print("usage: python -m cuts.signals.vlm <video_path> [interval_sec]")
@@ -439,6 +343,7 @@ if __name__ == "__main__":
     t1 = time.time()
     descs = describe_batch(encoded, cfg.vlm, ocr_texts=ocr_texts, verbose=True)
     for t, ocr, d in zip(stamps, ocr_texts, descs):
-        print(f"\n[t={t:6.1f}s] ({len(ocr)} chars ocr, {len(d.split())} words)")
+        words = len(d.split()) if d else 0
+        print(f"\n[t={t:6.1f}s] ({len(ocr)} chars ocr, {words} words)")
         print(f"    {d!r}")
     print(f"\ndescribe {time.time() - t1:.1f}s / total {time.time() - t0:.1f}s")

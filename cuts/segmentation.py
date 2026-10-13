@@ -34,6 +34,11 @@ ranked *below* false dips caused by nothing more than content scrolling. The
 text channel separates those cases because the words on screen change
 completely at a real activity change and barely at all during a scroll.
 
+Here the "sampled frames" are Pass 1 observations (`cuts.observe`): the
+DINOv2 vector and the description are both recorded per observation, so this
+segmenter reads the same cache as `cuts.coalesce` and needs no decode of its
+own. It returns boundary *positions*; `cuts.chapters` turns them into events.
+
 Fusion happens in z-score space. The channels have incomparable native scales
 (DINOv2 adjacent cosine sits around 0.99 on screen capture; TF-IDF cosine is
 far lower and much more spread out), so a raw weighted average would let
@@ -46,12 +51,13 @@ nothing.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .chapters import enforce_min_duration
 from .config import SegmentationConfig
-from .schema import Event
+from .observe import OK, UNDECODABLE, Observation
 from .signals.text_features import text_features
 
 
@@ -61,21 +67,92 @@ from .signals.text_features import text_features
 
 @dataclass
 class SegmentationInput:
-    """Everything segmentation needs about the sampled frames.
+    """Everything segmentation needs about the samples.
 
     All sequences are parallel and ordered by time. `dino` may be None when
     the visual channel is disabled; `vlm_texts` / `transcript_texts` may be
     None when those signals were not collected.
     """
 
-    frame_indices: List[int]
     times: List[float]
     dino: Optional[np.ndarray] = None
     vlm_texts: Optional[List[str]] = None
     transcript_texts: Optional[List[str]] = None
 
     def __len__(self) -> int:
-        return len(self.frame_indices)
+        return len(self.times)
+
+
+@dataclass
+class Segmentation:
+    """What `segment` decided: boundary positions after the first event."""
+
+    bounds: List[int]
+    fused: Optional[np.ndarray] = None
+    channels: List[str] = field(default_factory=list)
+
+    @property
+    def starts(self) -> List[int]:
+        return [0] + list(self.bounds)
+
+    def boundary_score(self, start: int) -> Optional[float]:
+        if self.fused is None or start >= len(self.fused):
+            return None
+        return float(self.fused[start])
+
+
+def carry_forward(
+    texts: Sequence[Optional[str]],
+    reset_at: Optional[Sequence[int]] = None,
+) -> List[str]:
+    """Fill gaps with the most recent description.
+
+    A sample with no description (withheld, or its call failed) is not a
+    change on screen: filling it with "" would read as "everything vanished"
+    and manufacture a boundary. `reset_at` lists positions where that
+    assumption breaks — the file joins, since screen content does not
+    persist across a gap of hours between two recordings.
+    """
+    resets = set(reset_at or ())
+    out: List[str] = []
+    last = ""
+    for i, t in enumerate(texts):
+        if i in resets:
+            last = ""
+        if t:
+            last = t
+        out.append(last)
+    return out
+
+
+def usable_observations(
+    observations: Sequence[Observation], use_dino: bool
+) -> List[Observation]:
+    """The observations the curve can place: decodable, and embedded if needed."""
+    return [o for o in observations
+            if o.status != UNDECODABLE
+            and (not use_dino or o.embedding is not None)]
+
+
+def input_from_observations(
+    observations: Sequence[Observation],
+    use_dino: bool,
+    joins: Sequence[int] = (),
+) -> SegmentationInput:
+    """Build the curve's input from (usable) observations."""
+    dino = None
+    if use_dino and observations and all(o.embedding is not None for o in observations):
+        dino = np.asarray([o.embedding for o in observations], dtype=np.float32)
+    texts = carry_forward(
+        [o.description if o.status == OK else None for o in observations],
+        reset_at=joins,
+    )
+    return SegmentationInput(
+        times=[o.t for o in observations],
+        dino=dino,
+        vlm_texts=texts,
+        transcript_texts=[o.transcript_text for o in observations],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +289,9 @@ def find_local_minima(curve: np.ndarray) -> List[int]:
     A point qualifies when it is no greater than both neighbours. Plateaus are
     reported once, at their centre, so a flat-bottomed dip does not emit a
     cluster of adjacent boundaries.
+
+    A minimum marks *where* the curve dips, not which side of the cut each
+    sample belongs to — see `snap_to_cuts` for that.
     """
     n = len(curve)
     if n < 3:
@@ -231,6 +311,40 @@ def find_local_minima(curve: np.ndarray) -> List[int]:
         else:
             i += 1
     return minima
+
+
+def snap_to_cuts(
+    minima: Sequence[int],
+    channels: Dict[str, np.ndarray],
+    config: SegmentationConfig,
+) -> List[int]:
+    """Turn each dip into the position where the new event starts.
+
+    The neighbourhood score is symmetric: a clean change between samples
+    k-1 and k depresses *both* of them by the same amount, so which one is
+    the minimum is decided by codec noise, and half the time the chapter
+    would start one sample early. The cut itself is the least similar
+    adjacent pair, which is not ambiguous — so each minimum m is moved to
+    m if the pair (m-1, m) is the sharper change, else to m+1. Adjacent
+    similarity is fused across channels the same way the curve is.
+    """
+    n = next(iter(channels.values())).shape[0] if channels else 0
+    if n < 2:
+        return list(minima)
+    adjacent = {
+        name: np.sum(feats[:-1] * feats[1:], axis=1).astype(np.float32)
+        for name, feats in channels.items()
+    }
+    # adj[k] = fused similarity between samples k and k+1
+    adj = fuse_curves(adjacent, config)
+    out = set()
+    for m in minima:
+        before = adj[m - 1] if m >= 1 else np.inf
+        after = adj[m] if m < n - 1 else np.inf
+        start = m if before <= after else m + 1
+        if 0 < start < n:
+            out.add(start)
+    return sorted(out)
 
 
 # ---------------------------------------------------------------------------
@@ -327,42 +441,6 @@ def merge_to_target(
     return bounds
 
 
-def _enforce_min_duration(
-    bounds: List[int],
-    times: Sequence[float],
-    min_sec: float,
-    total_end: float,
-    locked: Optional[Sequence[int]] = None,
-) -> List[int]:
-    """Drop boundaries that would create an event shorter than `min_sec`.
-
-    Applied after merging so the target count is respected first. Walks left to
-    right and removes any boundary too close to the previous one, which
-    prevents three-second "chapters" without disturbing well-spaced ones.
-
-    `locked` boundaries survive this pass too. A file that ends two seconds
-    after its last activity change still ends there; suppressing that join to
-    satisfy a minimum length would silently stitch two recordings into one
-    chapter, which is the exact error this is meant to avoid.
-    """
-    locked_set = set(locked or ())
-    if min_sec <= 0 or not bounds:
-        return bounds
-    kept: List[int] = []
-    last_start_t = times[0] if times else 0.0
-    for b in sorted(bounds):
-        t = times[b] if b < len(times) else total_end
-        if b in locked_set or t - last_start_t >= min_sec:
-            kept.append(b)
-            last_start_t = t
-    # The final event must also clear the bar; if not, drop its opening bound.
-    if kept and kept[-1] not in locked_set:
-        last_t = times[kept[-1]] if kept[-1] < len(times) else total_end
-        if total_end - last_t < min_sec:
-            kept.pop()
-    return kept
-
-
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
@@ -386,25 +464,20 @@ def resolve_target_events(
 def segment(
     inp: SegmentationInput,
     config: SegmentationConfig,
-    video_id: str = "video",
     duration_sec: float = 0.0,
     verbose: bool = False,
     forced_bounds: Optional[Sequence[int]] = None,
-) -> List[Event]:
-    """Run EFS Stage 1 and return the resulting events.
+) -> Segmentation:
+    """Run EFS Stage 1 and return where events begin.
 
-    Returns a single whole-video event when there is not enough signal to
-    partition on (very short input, or every channel unavailable) — callers
-    always get a valid, complete cover of the timeline.
+    With too little to partition on (very short input, or no channel with
+    content) only the forced boundaries are returned — callers always get a
+    valid, complete cover of the timeline.
 
     `forced_bounds` are sample positions that must open a new event regardless
-    of what the signal says. The pipeline passes the source-file joins, so a
-    chapter never spans two recordings.
+    of what the signal says: the source-file joins.
     """
     n = len(inp)
-    if n == 0:
-        return []
-
     end_time = duration_sec or (inp.times[-1] if inp.times else 0.0)
 
     # A forced bound at 0 is redundant (the first event starts there anyway)
@@ -415,7 +488,7 @@ def segment(
     if verbose:
         print(f"  channels: {list(channels.keys()) or ['(none)']}")
     if not channels or n < 3:
-        return _events_from_bounds(locked, inp, video_id, end_time, None)
+        return Segmentation(bounds=locked, channels=list(channels))
 
     curves = {
         name: similarity_curve(feats, config.window_size)
@@ -423,7 +496,7 @@ def segment(
     }
     fused = fuse_curves(curves, config)
 
-    minima = find_local_minima(fused)
+    minima = snap_to_cuts(find_local_minima(fused), channels, config)
     target = resolve_target_events(config, end_time)
     # The locked boundaries alone already imply this many events; asking for
     # fewer is unsatisfiable, so raise the target instead of merging forever.
@@ -433,93 +506,33 @@ def segment(
               + (f"  ({len(locked)} locked)" if locked else ""))
 
     bounds = merge_to_target(minima, channels, n, target, config, locked=locked)
-    bounds = _enforce_min_duration(
+    bounds = enforce_min_duration(
         bounds, inp.times, config.min_event_sec, end_time, locked=locked
     )
     if verbose:
         print(f"  final boundaries: {len(bounds)} -> {len(bounds) + 1} events")
-
-    return _events_from_bounds(bounds, inp, video_id, end_time, fused)
-
-
-def _events_from_bounds(
-    bounds: List[int],
-    inp: SegmentationInput,
-    video_id: str,
-    end_time: float,
-    fused: Optional[np.ndarray],
-) -> List[Event]:
-    """Materialize Event records from sample-space boundary indices."""
-    n = len(inp)
-    starts = [0] + list(bounds)
-    ends = list(bounds) + [n]
-
-    events: List[Event] = []
-    for k, (s, e) in enumerate(zip(starts, ends)):
-        if e <= s:
-            continue
-        sample_idx = list(range(s, e))
-        start_time = inp.times[s]
-        # An event runs up to the start of the next one, so the timeline is a
-        # gapless cover; the final event runs to the true end of the video.
-        end_t = inp.times[e] if e < n else end_time
-        events.append(Event(
-            video_id=video_id,
-            event_id=f"{k:04d}",
-            start_frame=inp.frame_indices[s],
-            end_frame=inp.frame_indices[min(e, n - 1)],
-            start_time=float(start_time),
-            end_time=float(max(end_t, start_time)),
-            sample_indices=[inp.frame_indices[i] for i in sample_idx],
-            metadata={
-                "boundary_score": (
-                    float(fused[s]) if fused is not None and s < len(fused) else None
-                ),
-                "n_samples": len(sample_idx),
-            },
-        ))
-    return events
+    return Segmentation(bounds=list(bounds), fused=fused, channels=list(channels))
 
 
 if __name__ == "__main__":
-    # Standalone debug: segment a video using the visual channel only, which
-    # needs no VLM/ASR setup, and print the resulting chapter skeleton.
+    # Standalone debug: segment a cached observations file with the curve
+    # (text and, when cached, visual channels) and print the skeleton.
     import sys
-    import time
 
+    from .chapters import join_positions
     from .config import CutsConfig
-    from .media import get_duration_sec, iter_sampled_frames
+    from .observe import read_observations
     from .schema import format_timestamp
-    from .signals.dino import embed_stream
 
     if len(sys.argv) < 2:
-        print("usage: python -m cuts.segmentation <video_path> [interval_sec]")
+        print("usage: python -m cuts.segmentation <observations.jsonl>")
         sys.exit(1)
-    path = sys.argv[1]
-    interval = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
-
     cfg = CutsConfig()
-    cfg.segmentation.weight_vlm = 0.0  # visual-only for this debug entry point
-    cfg.verbose = True
-
-    t0 = time.time()
-    metas: List[Tuple[int, float]] = []
-    frames = []
-    for sf in iter_sampled_frames(path, interval_sec=interval):
-        metas.append((sf.frame_idx, sf.time_sec))
-        frames.append(sf)
-    emb = embed_stream(iter(frames), cfg.dino, device=cfg.device,
-                       batch_size=cfg.sampling.batch_size)
-    del frames
-
-    inp = SegmentationInput(
-        frame_indices=[m[0] for m in metas],
-        times=[m[1] for m in metas],
-        dino=emb,
-    )
-    evs = segment(inp, cfg.segmentation, duration_sec=get_duration_sec(path),
-                  verbose=True)
-    print(f"\n{len(evs)} events in {time.time() - t0:.1f}s:")
-    for e in evs:
-        print(f"  {format_timestamp(e.start_time):>7}  "
-              f"({e.duration_sec:5.1f}s, {e.metadata['n_samples']} samples)")
+    obs, _meta = read_observations(sys.argv[1])
+    use_dino = any(o.embedding is not None for o in obs)
+    obs = usable_observations(obs, use_dino)
+    joins = join_positions(obs)
+    seg = segment(input_from_observations(obs, use_dino, joins),
+                  cfg.segmentation, verbose=True, forced_bounds=joins)
+    for s0 in seg.starts:
+        print(f"  {format_timestamp(obs[s0].t):>7}  score={seg.boundary_score(s0)}")

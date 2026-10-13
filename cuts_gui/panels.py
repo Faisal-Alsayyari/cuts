@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 from . import backend, theme
 from .jobs import RunState
 from .model import Index, Note, Session, Status, format_duration, format_time
-from .thumbs import ThumbnailService
+from .thumbs import ThumbnailService, pixelate
 
 
 def dot_icon(color: str, size: int = 10, hollow: bool = False) -> QIcon:
@@ -475,10 +475,10 @@ class _NotesModel(QAbstractTableModel):
             if col == 0:
                 return format_time(n.t)
             if n.withheld:
-                return "(withheld — not described)"
+                return f"({n.missing})"
             return n.description or "(no note)"
         if role == Qt.DecorationRole and col == 0:
-            if n.withheld:
+            if n.status == "withheld":
                 return self._icons["withheld"]
             return self._icons["redacted" if n.redacted else "ok"]
         if role == Qt.ForegroundRole and col == 1 and (n.withheld or not n.description):
@@ -502,7 +502,7 @@ class _NotesFilter(QSortFilterProxyModel):
 
     def filterAcceptsRow(self, row, parent) -> bool:
         n: Note = self.sourceModel().notes[row]
-        if self.flagged_only and not (n.redacted or n.withheld):
+        if self.flagged_only and not n.flagged:
             return False
         if not self.text:
             return True
@@ -618,7 +618,7 @@ class NotesPanel(QWidget):
         self.unavailable.setText(msg)
         self.unavailable.setVisible(bool(msg))
         if has:
-            flagged = sum(1 for n in notes if n.redacted or n.withheld)
+            flagged = sum(1 for n in notes if n.flagged)
             self.flagged.setText(f"Flagged ({flagged})")
         self._show(-1)
 
@@ -665,7 +665,7 @@ class NotesPanel(QWidget):
     def _reveal(self) -> None:
         if not self._revealed and self.index and \
                 0 <= self._shown < len(self.index.notes) and \
-                self.index.notes[self._shown].redacted:
+                self.index.notes[self._shown].flagged:
             self._revealed = True
             self._refresh_thumb()
 
@@ -693,8 +693,8 @@ class NotesPanel(QWidget):
             meta.append(f"<span style='color:{theme.DANGER}'>credentials blacked "
                         f"out ({e(', '.join(sorted(set(n.redacted))))})</span>")
         if n.withheld:
-            meta.append(f"<span style='color:{theme.DANGER}'>withheld — never "
-                        f"uploaded or described</span>")
+            col = theme.DANGER if n.status == "withheld" else theme.MUTED
+            meta.append(f"<span style='color:{col}'>{e(n.missing)}</span>")
         self.meta.setText(" · ".join(meta))
         self.desc.setText(n.description or "")
         if n.transcript:
@@ -725,12 +725,9 @@ class NotesPanel(QWidget):
         # the "Flagged" filter otherwise puts every secret in the recording
         # front and centre, which is the last thing you want on a shared
         # screen.
-        hide = bool(n.redacted) and not self._revealed
+        hide = n.flagged and not self._revealed
         if hide:
-            small = img.scaled(max(1, img.width() // 28), max(1, img.height() // 28),
-                               Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            img = small.scaled(img.width(), img.height(), Qt.IgnoreAspectRatio,
-                               Qt.SmoothTransformation)
+            img = pixelate(img)
         pm = QPixmap.fromImage(img)
         pm.setDevicePixelRatio(dpr)
         if hide:
@@ -865,14 +862,14 @@ class RunPanel(QWidget):
             msgs.append(f"<p style='color:{col}'>⚠ {html.escape(w)}{extra}</p>")
         self.warnings.setText("".join(msgs))
 
-        if self._lines_shown > len(st.log):
+        if self._lines_shown > st.total_lines:
             self.log.clear()
             self._lines_shown = 0
-        new = st.log[self._lines_shown:]
+        new = st.lines_since(self._lines_shown)
         if new:
             bar = self.log.verticalScrollBar()
             at_end = bar.value() >= bar.maximum() - 4
             self.log.appendPlainText("\n".join(new))
-            self._lines_shown = len(st.log)
+            self._lines_shown = st.total_lines
             if at_end:
                 bar.setValue(bar.maximum())

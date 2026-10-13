@@ -5,8 +5,8 @@ and evidence text. This module exists solely to give that vision call exact
 strings (file names, error messages) instead of asking it to read them off a
 downscaled JPEG, which is where it goes wrong on small monospace text.
 
-Because it only ever runs on frames the VLM's stride already selected, there
-is no independent stride or carry-forward here — one call in, one string out.
+It only runs on frames that are about to be uploaded for description — one
+call in, one string out.
 
 It has a second job: the engine returns a bounding box alongside every line it
 reads, and `cuts.redact` uses those boxes to black out credentials in the

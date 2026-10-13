@@ -12,18 +12,18 @@ hyperparameter sweeps trivial: instantiate a different config and re-run.
 
 Section names map onto the pipeline stages:
 
-    sampling     -> cuts.media           (decode 1 frame per N seconds)
-    observe      -> cuts.observe         (Pass 1: sharded, independent frames)
+    sampling     -> cuts.observe         (the sample grid; DINOv2 frame size)
+    observe      -> cuts.observe         (Pass 1: sharded, resumable, cached)
     dino / vlm / ocr / asr -> cuts.signals.*  (per-sample feature extraction;
                                                 ocr grounds vlm, not a channel)
     redact       -> cuts.redact          (black out credentials pre-upload)
+    llm          -> cuts.llm             (shared client + global request cap)
     coalesce     -> cuts.coalesce        (Pass 2: chapters from observations)
     segmentation -> cuts.segmentation    (EFS Stage 1: the `curve` alternative
-                                          to coalesce, kept as a baseline)
+                                          to coalesce, and its fallback)
     refine       -> cuts.refine          (single-bisection boundary sharpening)
-    labeling     -> cuts.labeling        (Claude-written chapter titles; the
-                                          `llm` path titles in coalesce instead)
-    select       -> cuts.select          (EFS Stages 2-3: query-driven frames)
+    labeling     -> cuts.labeling        (chapter titles for curve chapters;
+                                          coalesce titles its own)
 
 `CutsConfig.segmenter` picks between the two boundary strategies — see its
 comment for what the choice costs.
@@ -70,11 +70,10 @@ class SamplingConfig:
     # Seconds between sampled frames.
     sample_interval_sec: float = 30.0
     # Long-edge (pixels) each sampled frame is resized to before it is handed
-    # to DINOv2. The VLM channel does its own resize (VLMConfig.frame_long_edge)
-    # since it wants a different, usually larger, target.
+    # to DINOv2 (curve segmenter only). The VLM channel does its own resize
+    # (VLMConfig.frame_long_edge) since it wants a different, larger, target.
     frame_long_edge: int = 448
-    # Decoded frames are never all held at once; this bounds the working set
-    # handed to the embedder per batch. Tuned down for 8 GB unified memory.
+    # Frames per DINOv2 forward pass. Tuned down for 8 GB unified memory.
     batch_size: int = 16
 
 
@@ -128,6 +127,8 @@ class ObserveConfig:
     # Cache observations to <stem>.observations.jsonl and reuse them when the
     # inputs match. This is what makes Pass 2 cheap to iterate on: coalescing
     # can be re-run any number of times against one paid observation pass.
+    # The cache is written shard by shard, so an interrupted run resumes, and
+    # samples whose description failed are retried on the next run.
     cache: bool = True
 
 
@@ -229,9 +230,12 @@ class VLMConfig:
     that reads like an event log entry, not a transcript to skim past.
 
     The tradeoff this makes deliberately: local compute for network calls.
-    Requires ANTHROPIC_API_KEY. There is no fallback to a plain-OCR channel —
-    if credentials are absent, the pipeline segments on the visual channel
-    alone rather than silently degrading to a noisier local text extractor.
+    Requires Anthropic credentials. There is no fallback to a plain-OCR
+    channel: without credentials the default `llm` segmenter refuses to
+    start, and `--segmenter curve` runs on the visual channel alone.
+
+    Concurrency is not configured here: every API call goes through
+    `cuts.llm`, which caps requests in flight globally (LLMConfig).
     """
 
     enabled: bool = True
@@ -253,24 +257,21 @@ class VLMConfig:
     # truncate the tail of a response. Short by design: one sentence per
     # frame, not a transcript.
     max_tokens_per_frame: int = 60
-    # Cap on description batches in flight at once. The decode loop submits
-    # without waiting, so without a cap a fast decode on a long input would
-    # queue unbounded encoded frames; this bounds it to roughly
-    # frames_per_call * max_inflight_chunks frames of JPEG.
-    max_inflight_chunks: int = 12
     # Long-edge (pixels) sent to the API. Keeps payload size (and therefore
     # cost) small. Deliberately not raised for legibility — that's what OCR
     # grounding is for; this only needs to carry visual/layout context.
     frame_long_edge: int = 768
-    # Describe every Nth sampled frame and carry the text forward between
-    # reads — same tradeoff local OCR's stride used to make, kept in case a
-    # very long input needs to cut API calls further than a coarser
-    # `sample_interval_sec` already does.
-    stride: int = 1
-    # Concurrent API calls in flight per batch. Description calls are
-    # network-latency-bound, not compute-bound, so this is the real speed
-    # lever for this channel.
-    concurrency: int = 6
+
+
+@dataclass
+class LLMConfig:
+    """Shared settings for every Claude API call (see cuts.llm)."""
+
+    # Requests in flight at once, across every shard, thread and stage of a
+    # run. Description calls are network-latency-bound, so this is the speed
+    # lever for Pass 1; it is also what keeps a many-core machine from
+    # tripping rate limits by firing one batch per shard at once.
+    max_concurrency: int = 8
 
 
 @dataclass
@@ -417,45 +418,6 @@ class LabelingConfig:
     max_vlm_chars: int = 1500
     # Characters of transcript per event included in the prompt.
     max_transcript_chars: int = 1500
-    # Label all events in a single call so the model can keep titles
-    # non-redundant and consistent across the video. False = one call each.
-    batch_all_events: bool = True
-
-
-@dataclass
-class SelectConfig:
-    """EFS Stages 2-3 — query-driven keyframe selection.
-
-    This is the part of arXiv 2603.00983 that requires a text query. It is NOT
-    used by chapter generation (which is query-free); it exists for retrieval
-    and for the future "find the moment matching this description" workflow.
-    """
-
-    # Number of keyframes to return (paper tests k in {8, 16, 32, 64}).
-    top_k: int = 16
-    # MMR tradeoff: lambda * query_relevance - (1 - lambda) * redundancy.
-    mmr_lambda: float = 0.5
-    # Adaptive-threshold relaxation factor alpha. The paper finds 0.5 best on
-    # VideoMME and 0.1 on LongVideoBench/MLVU.
-    alpha: float = 0.5
-    # Scoring backend for query-frame relevance. "clip" uses open-clip and is
-    # the lightweight stand-in for the paper's BLIP2-ITM.
-    scorer: str = "clip"
-    clip_model: str = "ViT-B-32"
-    clip_pretrained: str = "openai"
-
-
-@dataclass
-class SearchConfig:
-    """Text search over indexed events (BM25 + optional embeddings, RRF)."""
-
-    # sentence-transformers model for event text embeddings.
-    text_embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    enable_text_embeddings: bool = True
-    # Reciprocal Rank Fusion constant. 60 is the canonical default.
-    rrf_k: int = 60
-    default_top_k: int = 5
-    snippet_half_chars: int = 40
 
 
 @dataclass
@@ -469,9 +431,10 @@ class CutsConfig:
     #             cuts.coalesce). Judgement-based, non-deterministic, and the
     #             only path that can collapse a long uninteresting stretch.
     #   "curve" — the DINOv2 + TF-IDF similarity curve and count-budget merge
-    #             (cuts.segmentation). Deterministic; kept as the baseline to
-    #             regression-test against, and as the fallback when the
-    #             coalescing call fails.
+    #             (cuts.segmentation), over the same Pass 1 observations.
+    #             Deterministic for a given observation cache; the baseline to
+    #             compare against, the fallback when coalescing fails, and the
+    #             only mode that works without API credentials.
     segmenter: str = "llm"
 
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
@@ -480,17 +443,12 @@ class CutsConfig:
     vlm: VLMConfig = field(default_factory=VLMConfig)
     ocr: OCRConfig = field(default_factory=OCRConfig)
     redact: RedactConfig = field(default_factory=RedactConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     asr: ASRConfig = field(default_factory=ASRConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     coalesce: CoalesceConfig = field(default_factory=CoalesceConfig)
     refine: RefineConfig = field(default_factory=RefineConfig)
     labeling: LabelingConfig = field(default_factory=LabelingConfig)
-    select: SelectConfig = field(default_factory=SelectConfig)
-    search: SearchConfig = field(default_factory=SearchConfig)
-
-    # Optional cache directory for the frame_idx -> (pts, time_sec) lookup
-    # tables and computed embeddings. None disables caching.
-    cache_dir: Optional[str] = None
 
     # When True, each pipeline stage prints its name, input size, and elapsed
     # time to stdout.

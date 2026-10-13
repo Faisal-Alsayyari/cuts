@@ -4,26 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cuts"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.12"
 description = "Semantic indexing and temporal navigation of long-form video"
 dependencies = [
-    "av",
-    "numpy",
-    "opencv-python",
-    "pillow",
-    "torch",
-    "torchvision",
-    "transformers",
-    "rapidocr-onnxruntime",
-    "faster-whisper",
-    "anthropic",
-    "python-dotenv",
+    "av>=14",                    # av.FFmpegError; av.AVError is gone since 14
+    "numpy>=1.26",
+    "opencv-python>=4.8",
+    "rapidocr-onnxruntime>=1.2",
+    "faster-whisper>=1.0",       # optional at runtime: ASR is skipped if absent
+    "anthropic>=1.0",
+    "python-dotenv>=1.0",
 ]
+
+[project.optional-dependencies]
+# DINOv2 visual channel for `--segmenter curve`.
+curve = ["torch>=2.2", "torchvision>=0.17", "transformers>=4.40", "pillow>=10"]
+# Desktop front end (`cuts-gui`).
+gui = ["PySide6>=6.6"]
+dev = ["pytest>=8"]
 
 [project.scripts]
 cuts = "cuts.cli:main"
+cuts-gui = "cuts_gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cuts*"]
+include = ["cuts", "cuts.*", "cuts_gui", "cuts_gui.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

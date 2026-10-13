@@ -1,5 +1,7 @@
 # 02 — Execution paths, end to end
 
+> **Pre-refactor.** This document describes the code at `c39a118`. The pipeline was since unified on branch `refactor/unify-pipeline`; see [12-unified-pipeline.md](12-unified-pipeline.md) for what changed.
+
 This document follows each command from argv to the files it writes. Stage
 internals are covered in later documents; here the focus is control flow,
 what feeds what, and which branches exist.

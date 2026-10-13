@@ -1,7 +1,9 @@
 """Turn segmented events into named chapters.
 
-Segmentation says *where* the boundaries are; this module says *what each span
-is*. Given an event's evidence — VLM screen descriptions from its frames, any
+The curve segmenter (and the coalescing fallback, which uses it) says *where*
+the boundaries are; this module says *what each span is*. Chapters from
+`cuts.coalesce` already carry titles and do not come through here, except
+when `cuts label` re-titles an existing index. Given an event's evidence — VLM screen descriptions from its frames, any
 transcript in its time window, and optionally a couple of representative
 frames — it writes the short activity label a chapter list needs ("debugging
 segfault").
@@ -24,18 +26,13 @@ has no idea what the others said.
 from __future__ import annotations
 
 import base64
-import json
 import os
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import llm
 from .config import LabelingConfig, OCRConfig, RedactConfig
-from .media import (
-    Timeline,
-    decode_frames_at,
-    iter_frames_at_times,
-    resize_long_edge,
-)
+from .media import Timeline, iter_frames_at_times, resize_long_edge
 from .schema import Event, format_timestamp
 from .signals.text_features import tokenize
 
@@ -99,28 +96,12 @@ weigh them for what they say about the activity, not as exact quotes.
 # Evidence assembly
 # ---------------------------------------------------------------------------
 
-def _pick_representative(event: Event, n: int) -> List[int]:
-    """Choose up to `n` sample frame indices spread across the event.
-
-    Endpoints are avoided: the first and last samples of an event sit next to
-    a boundary, where the screen is most likely mid-transition.
-    """
-    samples = event.sample_indices
-    if not samples or n <= 0:
-        return []
-    if len(samples) <= n:
-        return list(samples)
-    # Evenly spaced interior positions.
-    step = len(samples) / (n + 1)
-    return [samples[min(len(samples) - 1, int(step * (k + 1)))] for k in range(n)]
-
-
 def _pick_times(event: Event, n: int) -> List[float]:
-    """`_pick_representative` on timestamps: the `llm` path's frame identifier.
+    """Up to `n` of the event's representative times, evenly spread.
 
-    `cuts.coalesce` already chose representatives when it built the event, so
-    the usual case here is just honouring them; this re-spreads only when the
-    caller wants a different count than was stored.
+    `cuts.chapters` already chose representatives when it built the event
+    (interior samples, never withheld ones), so the usual case is just
+    honouring them; this re-spreads only when a different count is wanted.
     """
     times = event.representative_times or event.sample_times
     if not times or n <= 0:
@@ -161,68 +142,37 @@ def _decode_representatives(
 ) -> Dict[str, List[Any]]:
     """Decode each event's representative frames, keyed by event_id.
 
-    Events carry their representatives either as timestamps or as frame
-    indices, and which one depends on how they were produced:
-
-      * `representative_times` — the `llm` path. Frames were reached by
-        seeking, so they never had an ordinal. Decoded the same way, by
-        seeking, which also means only the wanted frames are touched.
-      * `representative_frames` — the `curve` path, which decodes sequentially
-        and therefore knows each frame's index. Decoded in one pass per file,
-        since the naive alternative is O(N x length).
-
-    Times win when an event has both. Frames are grouped by the file that owns
-    them either way, so each source is opened once rather than once per frame.
+    Frames are reached by seeking to their timestamps, grouped by the file
+    that owns them so each source is opened once. Sources whose file is no
+    longer on disk are skipped; those events are labeled from text alone.
     """
-    by_time: Dict[str, List[Tuple[str, float]]] = {}
-    by_index: Dict[str, List[Tuple[str, int]]] = {}
-    times_per_source: Dict[str, List[float]] = {}
-    idx_per_source: Dict[str, List[int]] = {}
-
+    by_event: Dict[str, List[Tuple[str, float]]] = {}
+    per_source: Dict[str, List[float]] = {}
     for e in events:
-        if e.representative_times:
-            picks: List[Tuple[str, float]] = []
-            for g in _pick_times(e, config.frames_per_event):
-                src, local = timeline.local_time(g)
-                picks.append((src.path, local))
-                times_per_source.setdefault(src.path, []).append(local)
-            by_time[e.event_id] = picks
-        elif e.representative_frames or e.sample_indices:
-            picks_i: List[Tuple[str, int]] = []
-            for g in _pick_representative(e, config.frames_per_event):
-                found = timeline.local_frame(g)
-                # Single-source indexes written before frame_span was recorded,
-                # and any index outside every known span, fall back to file 0.
-                src, local = found if found else (timeline.sources[0], g)
-                picks_i.append((src.path, local))
-                idx_per_source.setdefault(src.path, []).append(local)
-            by_index[e.event_id] = picks_i
+        picks: List[Tuple[str, float]] = []
+        for g in _pick_times(e, config.frames_per_event):
+            src, local = timeline.local_time(g)
+            if not os.path.exists(src.path):
+                continue
+            picks.append((src.path, local))
+            per_source.setdefault(src.path, []).append(local)
+        if picks:
+            by_event[e.event_id] = picks
 
-    n_wanted = (sum(len(v) for v in by_time.values())
-                + sum(len(v) for v in by_index.values()))
-    if not n_wanted:
+    if not per_source:
         return {}
     if verbose:
-        n_src = len(set(times_per_source) | set(idx_per_source))
+        n_wanted = sum(len(v) for v in by_event.values())
         print(f"  decoding {n_wanted} frames for labeling "
-              f"across {n_src} file(s)...")
+              f"across {len(per_source)} file(s)...")
 
-    decoded_t: Dict[str, Dict[float, Any]] = {
+    decoded: Dict[str, Dict[float, Any]] = {
         path: {t: (sf.image if sf else None)
                for t, sf in iter_frames_at_times(path, ts)}
-        for path, ts in times_per_source.items()
+        for path, ts in per_source.items()
     }
-    decoded_i: Dict[str, Dict[int, Any]] = {
-        path: decode_frames_at(path, idxs)
-        for path, idxs in idx_per_source.items()
-    }
-
-    out: Dict[str, List[Any]] = {}
-    for eid, picks in by_time.items():
-        out[eid] = [decoded_t.get(p, {}).get(t) for p, t in picks]
-    for eid, picks_i in by_index.items():
-        out[eid] = [decoded_i.get(p, {}).get(i) for p, i in picks_i]
-    return out
+    return {eid: [decoded.get(p, {}).get(t) for p, t in picks]
+            for eid, picks in by_event.items()}
 
 
 def _encode_frames(
@@ -234,10 +184,6 @@ def _encode_frames(
     redact_config: Optional[RedactConfig] = None,
 ) -> Dict[str, List[str]]:
     """Decode and base64-JPEG-encode representative frames, keyed by event_id.
-
-    Decoding is delegated to `_decode_representatives`, which resolves an
-    event's representatives by timestamp or by frame index depending on how it
-    was produced.
 
     These frames are decoded fresh here rather than kept from the sampling
     pass, so they have never been through `cuts.redact` — this is an upload
@@ -337,60 +283,20 @@ def _build_content(
 # ---------------------------------------------------------------------------
 
 def _call_claude(
-    content: List[Dict[str, Any]],
-    config: LabelingConfig,
-    api_key: Optional[str] = None,
+    content: List[Dict[str, Any]], config: LabelingConfig
 ) -> List[Dict[str, str]]:
     """One structured-output call returning [{event_id, title}, ...].
 
-    Raises RuntimeError on refusal or truncation so the caller can decide
-    whether to degrade to heuristic labels rather than silently emitting
-    partial results.
+    Raises `llm.LLMError` on refusal, truncation or anything else short of a
+    parsed response, so the caller can degrade to heuristic labels rather
+    than silently emitting partial results.
     """
-    import anthropic
-
-    # A bare constructor also resolves an `ant auth login` profile, so do not
-    # require an explicit key.
-    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-
-    request: Dict[str, Any] = dict(
-        model=config.model,
-        max_tokens=config.max_tokens,
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": content}],
-        output_config={
-            "effort": config.effort,
-            "format": {"type": "json_schema", "schema": _CHAPTER_SCHEMA},
-        },
+    data = llm.structured_call(
+        model=config.model, system=_SYSTEM, content=content,
+        schema=_CHAPTER_SCHEMA, max_tokens=config.max_tokens,
+        effort=config.effort, fallbacks=config.use_fallbacks,
     )
-
-    if config.use_fallbacks:
-        try:
-            response = client.beta.messages.create(
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-                **request,
-            )
-        except anthropic.BadRequestError:
-            # The fallbacks beta is not available to this account/SDK version;
-            # the labeling call itself is still perfectly valid without it.
-            response = client.messages.create(**request)
-    else:
-        response = client.messages.create(**request)
-
-    if response.stop_reason == "refusal":
-        detail = getattr(response, "stop_details", None)
-        category = getattr(detail, "category", None) if detail else None
-        raise RuntimeError(f"labeling refused by safety classifiers ({category})")
-    if response.stop_reason == "max_tokens":
-        raise RuntimeError(
-            "labeling response hit max_tokens; raise LabelingConfig.max_tokens"
-        )
-
-    text = next((b.text for b in response.content if b.type == "text"), "")
-    if not text:
-        raise RuntimeError("labeling response contained no text block")
-    return json.loads(text).get("chapters", [])
+    return data.get("chapters", []) or []
 
 
 # ---------------------------------------------------------------------------
@@ -452,40 +358,30 @@ def _heuristic_labels(events: Sequence[Event]) -> List[Dict[str, str]]:
 
 def label_events(
     events: List[Event],
-    source: Union[str, Timeline],
+    timeline: Timeline,
     config: LabelingConfig,
-    backend: str = "claude",
-    api_key: Optional[str] = None,
+    backend: str = "auto",
     verbose: bool = False,
     ocr_config: Optional[OCRConfig] = None,
     redact_config: Optional[RedactConfig] = None,
 ) -> str:
     """Set `title` on each event in place. Returns the backend actually used.
 
-    `source` is the `Timeline` the events were segmented from, or a single
-    video path (which is wrapped into a one-file timeline).
+    `backend` is "claude", "heuristic", or "auto" (Claude when credentials
+    are available). A failed Claude call degrades to heuristic titles rather
+    than aborting: a chapter list with crude titles is far more useful than
+    no output at all after a full analysis.
 
     `ocr_config`/`redact_config` drive credential redaction on the frames sent
     with the labeling call (see `cuts.redact`). They default to the standard
-    config rather than to "off", so a caller that forgets to pass them — the
-    standalone `__main__` path, say — still gets redaction.
-
-    `backend` is "claude", "heuristic", or "auto". Under "auto" — and under
-    "claude" when the call fails — labeling degrades to heuristic rather than
-    aborting: a chapter list with crude titles is far more useful than no
-    output at all after a full segmentation pass.
+    config rather than to "off", so a caller that forgets to pass them still
+    gets redaction.
     """
     if not events or not config.enabled:
         return "none"
 
-    timeline = Timeline.build([source]) if isinstance(source, str) else source
-
-    have_creds = bool(api_key or os.environ.get("ANTHROPIC_API_KEY"))
     if backend == "auto":
-        backend = "claude" if have_creds else "heuristic"
-
-    # Fail safe, not open: a caller that passes neither gets redaction on with
-    # stock settings rather than silently uploading raw frames.
+        backend = "claude" if llm.has_credentials() else "heuristic"
     if ocr_config is None:
         ocr_config = OCRConfig()
     if redact_config is None:
@@ -503,10 +399,10 @@ def label_events(
                 n_img = sum(len(v) for v in frames.values())
                 print(f"  labeling {len(events)} events via {config.model} "
                       f"({n_img} frames)...")
-            chapters = _call_claude(content, config, api_key=api_key)
+            chapters = _call_claude(content, config)
             used = "claude"
         except Exception as exc:
-            print(f"[labeling] Claude backend failed ({exc!r}); "
+            print(f"[labeling] Claude backend failed ({exc}); "
                   f"falling back to heuristic labels")
             chapters = _heuristic_labels(events)
             used = "heuristic"
@@ -521,25 +417,9 @@ def label_events(
 
 
 if __name__ == "__main__":
-    # Standalone debug: label an existing events.json in place.
+    # Standalone debug: `python -m cuts label` is the real command.
     import sys
 
-    from .config import CutsConfig
-    from .schema import read_events, to_chapter_list, write_events
+    from .cli import main
 
-    if len(sys.argv) < 2:
-        print("usage: python -m cuts.labeling <events.json> [claude|heuristic|auto]")
-        sys.exit(1)
-    path = sys.argv[1]
-    backend = sys.argv[2] if len(sys.argv) > 2 else "auto"
-
-    cfg = CutsConfig()
-    payload = read_events(path)
-    evs = payload["events"]
-    tl = Timeline.from_dicts(payload["sources"])
-    used = label_events(evs, tl, cfg.labeling, backend=backend, verbose=True)
-    write_events(path, payload["video_id"], payload["video_path"], evs,
-                 duration_sec=payload.get("duration_sec", 0.0),
-                 sources=payload["sources"])
-    print(f"\nbackend: {used}\n")
-    print(to_chapter_list(evs))
+    sys.exit(main(["label", *sys.argv[1:]]))

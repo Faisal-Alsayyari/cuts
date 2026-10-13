@@ -1,5 +1,7 @@
 # 10 — Concurrency, caching, and error handling (cross-cutting)
 
+> **Pre-refactor.** This document describes the code at `c39a118`. The pipeline was since unified on branch `refactor/unify-pipeline`; see [12-unified-pipeline.md](12-unified-pipeline.md) for what changed.
+
 ## 1. Every thread and process the system creates
 
 | Component | Mechanism | Size | Lifetime | Shared state |

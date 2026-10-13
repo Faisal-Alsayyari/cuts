@@ -1,5 +1,7 @@
 # 08 — LLM integration (and the state of "agentic" functionality)
 
+> **Pre-refactor.** This document describes the code at `c39a118`. The pipeline was since unified on branch `refactor/unify-pipeline`; see [12-unified-pipeline.md](12-unified-pipeline.md) for what changed.
+
 ## 1. Inventory of Claude API calls
 
 Every call is a single, non-streaming `messages.create` with a JSON-schema
