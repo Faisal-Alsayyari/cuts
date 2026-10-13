@@ -89,15 +89,11 @@ def transcribe(
 def align_to_samples(
     asr_segments: Sequence[Tuple[float, float, str]],
     sample_times: Sequence[float],
-    window_sec: float = 0.0,
 ) -> List[str]:
     """Map transcript segments onto sample times.
 
     Returns one string per sample time: the text of every transcript segment
-    whose span covers that instant. `window_sec` widens each sample into an
-    interval, which is useful when samples are sparse relative to speech —
-    with 1 fps sampling and typical Whisper segment lengths the default
-    point-in-time match is already dense enough.
+    whose span covers that instant.
 
     Both sequences are walked once in time order rather than compared
     pairwise; a long video can have thousands of each.
@@ -112,13 +108,12 @@ def align_to_samples(
     active: List[Tuple[float, float, str]] = []
 
     for i, t in enumerate(sample_times):
-        lo, hi = t - window_sec, t + window_sec
-        # Admit every segment that has started by the end of this window.
-        while cursor < len(ordered) and ordered[cursor][0] <= hi:
+        # Admit every segment that has started by this instant.
+        while cursor < len(ordered) and ordered[cursor][0] <= t:
             active.append(ordered[cursor])
             cursor += 1
-        # Retire segments that ended before this window began.
-        active = [s for s in active if s[1] >= lo]
+        # Retire segments that ended before it.
+        active = [s for s in active if s[1] >= t]
         if active:
             out[i] = " ".join(s[2] for s in active)
     return out

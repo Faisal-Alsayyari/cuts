@@ -39,7 +39,7 @@ from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
 from . import theme
 from .model import Index, format_duration, format_time
-from .thumbs import ThumbnailService
+from .thumbs import ThumbnailService, pixelate
 
 GUTTER = 74          # lane labels
 RIGHT_PAD = 10
@@ -320,7 +320,7 @@ class TimelineView(QWidget):
             i = self._note_at_x(x)
             if i >= 0:
                 n = self.index.notes[i]
-                body = (n.description or ("<i>withheld — not described</i>"
+                body = (n.description or (f"<i>{n.missing}</i>"
                                           if n.withheld else "<i>no note</i>"))
                 extra = ""
                 if n.redacted:
@@ -520,7 +520,7 @@ class TimelineView(QWidget):
             x = self._x(n.t)
             big = i in (self._sel_note, hover)
             half = 11 if big else 7
-            if n.redacted or n.withheld:
+            if n.flagged:
                 col = QColor(theme.DANGER)
             elif n.description:
                 col = QColor(theme.TEXT)
@@ -562,6 +562,8 @@ class TimelineView(QWidget):
             src, local = self.index.source_at(sample)
             img = self.thumbs.get(src.path, round(local, 1), width_px) \
                 if src.exists else None
+            if img is not None and self._near_flagged(sample, step / 2):
+                img = pixelate(img)
             if img is not None:
                 # Crop to the slot's aspect rather than letterboxing, so the
                 # strip reads as continuous footage.
@@ -573,6 +575,16 @@ class TimelineView(QWidget):
                 sx, sy = (img.width() - sw) / 2, (img.height() - sh) / 2
                 p.drawImage(r, img, QRectF(sx, sy, sw, sh))
             t += step
+
+    def _near_flagged(self, t: float, radius: float) -> bool:
+        """Whether the note nearest `t` (within `radius`) had credentials on screen."""
+        notes = self.index.notes if self.index else []
+        i = self.index.note_at(t) if notes else -1
+        near = [k for k in (i, i + 1) if 0 <= k < len(notes)
+                and abs(notes[k].t - t) <= radius]
+        if not near:
+            return False
+        return min((notes[k] for k in near), key=lambda n: abs(n.t - t)).flagged
 
     def _paint_joins(self, p: QPainter, lanes) -> None:
         if not self.index.is_multi:

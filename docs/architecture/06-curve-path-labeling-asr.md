@@ -1,5 +1,7 @@
 # 06 — Curve segmentation, labeling, ASR, and query selection
 
+> **Pre-refactor.** This document describes the code at `c39a118`. The pipeline was since unified on branch `refactor/unify-pipeline`; see [12-unified-pipeline.md](12-unified-pipeline.md) for what changed.
+
 Code: `cuts/segmentation.py`, `cuts/signals/dino.py`,
 `cuts/signals/text_features.py`, `cuts/labeling.py`, `cuts/signals/asr.py`,
 `cuts/select.py`.

@@ -34,23 +34,27 @@ matter what the model thought.
 deterministic, and chapter count and minimum length stop being guaranteed by
 construction — they are enforced afterwards instead. `--segmenter curve` stays
 available as the deterministic baseline to compare against, and is also where
-this falls back when the call fails.
+the pipeline falls back when this call fails.
 
 Titles come from this same call. Under the curve path titling is a second,
 separate pass (`cuts.labeling`) that has to re-derive what each span was
 about; here the model that drew a boundary is the one that names it, which is
 both cheaper and better grounded.
+
+This module only decides *where chapters begin* and what they are called;
+`cuts.chapters` turns that into events, exactly as it does for the curve.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
-from .config import CoalesceConfig, SegmentationConfig
+from . import llm
+from .chapters import enforce_min_duration
+from .config import CoalesceConfig
 from .media import Timeline
-from .observe import Observation
-from .schema import Event, format_timestamp
+from .observe import FAILED, UNDECODABLE, WITHHELD, Observation
+from .schema import format_timestamp
 
 # `kind` is not used for chapter generation today. It is recorded because the
 # eventual footage-cutting pass needs a priority signal, and the model that
@@ -143,6 +147,16 @@ _SCHEMA: Dict[str, Any] = {
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
+# How an observation with no description is shown to the model. These are
+# different facts and it should be able to tell them apart: a frame we chose
+# not to upload is not a frame that could not be read.
+_MISSING = {
+    WITHHELD: "(frame withheld: a credential was on screen)",
+    UNDECODABLE: "(no frame at this time)",
+    FAILED: "(description unavailable)",
+}
+
+
 def render_observations(
     observations: Sequence[Observation],
     config: CoalesceConfig,
@@ -162,7 +176,7 @@ def render_observations(
             last_source = o.source_index
             name = timeline.sources[o.source_index].name
             lines.append(f"--- new capture session: {name} ---")
-        text = o.description or ("(frame withheld)" if o.withheld else "(no description)")
+        text = o.description or _MISSING.get(o.status, "(no description)")
         lines.append(f"[{i}] {format_timestamp(o.t)}  {text}")
         if o.transcript_text:
             lines.append(f"      said: {o.transcript_text[:300]}")
@@ -208,44 +222,20 @@ def _build_prompt(
 # The call
 # ---------------------------------------------------------------------------
 
-def _call_claude(
-    prompt: str, config: CoalesceConfig, api_key: Optional[str] = None
-) -> List[Dict[str, Any]]:
+def _call_claude(prompt: str, config: CoalesceConfig) -> List[Dict[str, Any]]:
     """One structured-output call returning the raw chapter dicts.
 
-    Raises rather than returning something partial: the caller falls back to
-    the curve segmenter, which is a far better outcome than half a timeline.
+    Raises `llm.LLMError` rather than returning something partial: the caller
+    falls back to the curve segmenter, which is a far better outcome than half
+    a timeline.
     """
-    import anthropic
-
-    # A bare constructor also resolves an `ant auth login` profile, so do not
-    # require an explicit key.
-    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-
-    response = client.messages.create(
-        model=config.model,
-        max_tokens=config.max_tokens,
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-        output_config={
-            "effort": config.effort,
-            "format": {"type": "json_schema", "schema": _SCHEMA},
-        },
+    data = llm.structured_call(
+        model=config.model, system=_SYSTEM, content=prompt, schema=_SCHEMA,
+        max_tokens=config.max_tokens, effort=config.effort,
     )
-    if response.stop_reason == "refusal":
-        detail = getattr(response, "stop_details", None)
-        category = getattr(detail, "category", None) if detail else None
-        raise RuntimeError(f"coalescing refused by safety classifiers ({category})")
-    if response.stop_reason == "max_tokens":
-        raise RuntimeError(
-            "coalescing response hit max_tokens; raise CoalesceConfig.max_tokens"
-        )
-    text = next((b.text for b in response.content if b.type == "text"), "")
-    if not text:
-        raise RuntimeError("coalescing response contained no text block")
-    chapters = json.loads(text).get("chapters", [])
+    chapters = data.get("chapters") or []
     if not chapters:
-        raise RuntimeError("coalescing returned no chapters")
+        raise llm.LLMError("coalescing returned no chapters")
     return chapters
 
 
@@ -256,12 +246,15 @@ def _call_claude(
 def _validate_and_repair(
     chapters: List[Dict[str, Any]],
     observations: Sequence[Observation],
-    seg_config: SegmentationConfig,
+    min_event_sec: float,
     duration_sec: float,
     locked: Optional[Sequence[int]] = None,
     verbose: bool = False,
 ) -> List[Dict[str, Any]]:
     """Force the model's cut points into a valid partition, keeping its titles.
+
+    Returns one dict per chapter, in order, each with `start` (an observation
+    position), `title`, `reason` and `metadata.kind`.
 
     Cut points already make gaps and overlaps unexpressible, so this handles
     what remains: bad indices, bad ordering, a missing opening cut, file joins
@@ -275,10 +268,7 @@ def _validate_and_repair(
     locked_set = {int(b) for b in (locked or ()) if 0 < b < n}
 
     # Keep the first title offered for any given index; drop what cannot be
-    # read. `start` is rewritten with the parsed value rather than left as the
-    # model wrote it: this dict is sorted by the parsed index here and re-read
-    # by `_events_from_chapters`, and two independent parses of the same raw
-    # value are two chances to disagree about the ordering that was validated.
+    # read. Every later step uses the parsed integer, never the raw value.
     by_start: Dict[int, Dict[str, Any]] = {}
     for c in chapters:
         try:
@@ -300,12 +290,9 @@ def _validate_and_repair(
     starts = sorted(by_start)
 
     # Minimum duration, walked left to right exactly as the curve path does.
-    # `_enforce_min_duration` takes the boundaries *after* the first, which is
-    # what starts[1:] is, and already honours locked boundaries.
-    from .segmentation import _enforce_min_duration
     times = [o.t for o in observations]
-    kept = _enforce_min_duration(
-        starts[1:], times, seg_config.min_event_sec, duration_sec,
+    kept = enforce_min_duration(
+        starts[1:], times, min_event_sec, duration_sec,
         locked=sorted(locked_set),
     )
     final = [0] + list(kept)
@@ -313,91 +300,19 @@ def _validate_and_repair(
     if verbose and len(final) != len(starts):
         print(f"  [coalesce] validation dropped "
               f"{len(starts) - len(final)} boundary(ies) under "
-              f"{seg_config.min_event_sec:.0f}s")
+              f"{min_event_sec:.0f}s")
 
-    return [by_start[s] for s in final]
-
-
-def _events_from_chapters(
-    chapters: List[Dict[str, Any]],
-    observations: Sequence[Observation],
-    video_id: str,
-    duration_sec: float,
-) -> List[Event]:
-    """Materialize Events from validated cut points.
-
-    Mirrors `segmentation._events_from_bounds`: a chapter runs up to the start
-    of the next one and the last runs to the true end of the recording, so the
-    timeline stays a gapless cover.
-    """
-    n = len(observations)
-    starts = [int(c["start"]) for c in chapters]
-    ends = starts[1:] + [n]
-
-    events: List[Event] = []
-    for k, (c, s, e) in enumerate(zip(chapters, starts, ends)):
-        if e <= s:
-            continue
-        members = observations[s:e]
-        start_time = members[0].t
-        end_time = observations[e].t if e < n else duration_sec
-        events.append(Event(
-            video_id=video_id,
-            event_id=f"{k:04d}",
-            start_frame=-1,
-            end_frame=-1,
-            start_time=float(start_time),
-            end_time=float(max(end_time, start_time)),
-            title=str(c.get("title", "")).strip(),
-            summary=str(c.get("why", "")).strip(),
-            vlm_text="\n".join(_dedup(o.description for o in members)),
-            transcript_text=" ".join(_dedup(o.transcript_text for o in members)),
-            sample_times=[o.t for o in members],
-            representative_times=_pick_representative_times(members, 3),
-            metadata={
-                "kind": str(c.get("kind", "")).strip(),
-                "n_samples": len(members),
-                "n_withheld": sum(1 for o in members if o.withheld),
-                "segmenter": "llm",
-            },
-        ))
-    return events
-
-
-def _dedup(texts) -> List[str]:
-    """Distinct non-empty strings in first-seen order.
-
-    A static screen across consecutive samples repeats the same description
-    verbatim, so the raw concatenation would be one sentence copy-pasted a
-    dozen times — which is what the old `_attach_evidence` guarded against too.
-    """
-    seen, out = set(), []
-    for t in texts:
-        t = (t or "").strip()
-        key = t.lower()
-        if t and key not in seen:
-            seen.add(key)
-            out.append(t)
+    out: List[Dict[str, Any]] = []
+    for st in final:
+        c = by_start[st]
+        kind = str(c.get("kind", "")).strip()
+        out.append({
+            "start": st,
+            "title": str(c.get("title", "") or "").strip(),
+            "reason": str(c.get("why", "") or "").strip(),
+            "metadata": {"kind": kind if kind in _KINDS else "active"},
+        })
     return out
-
-
-def _pick_representative_times(
-    members: Sequence[Observation], n: int
-) -> List[float]:
-    """Up to `n` timestamps spread across the chapter, avoiding its endpoints.
-
-    Same rule as `labeling._pick_representative`, on times instead of frame
-    indices: the first and last samples sit next to a boundary, where the
-    screen is most likely mid-transition. Withheld frames are skipped — there
-    is no point choosing one we already declined to look at.
-    """
-    usable = [o for o in members if not o.withheld]
-    if not usable or n <= 0:
-        return []
-    if len(usable) <= n:
-        return [o.t for o in usable]
-    step = len(usable) / (n + 1)
-    return [usable[min(len(usable) - 1, int(step * (k + 1)))].t for k in range(n)]
 
 
 # ---------------------------------------------------------------------------
@@ -407,32 +322,28 @@ def _pick_representative_times(
 def coalesce(
     observations: Sequence[Observation],
     config: CoalesceConfig,
-    seg_config: SegmentationConfig,
-    video_id: str = "video",
+    min_event_sec: float,
     duration_sec: float = 0.0,
     timeline: Optional[Timeline] = None,
     locked: Optional[Sequence[int]] = None,
-    api_key: Optional[str] = None,
     verbose: bool = False,
-) -> Tuple[List[Event], str]:
-    """Coalesce observations into titled chapters. Returns `(events, backend)`.
+) -> Optional[List[Dict[str, Any]]]:
+    """Decide where chapters begin and what they are called.
 
-    `backend` is "llm" on success and "failed" when the call did not produce a
-    usable partition — the caller is expected to fall back to the curve
-    segmenter rather than ship an empty timeline.
+    Returns validated chapter dicts (see `_validate_and_repair`), ready for
+    `cuts.chapters.events_from_starts`, or None when the call did not produce
+    a usable partition — the caller then falls back to the curve segmenter.
 
-    `locked` are observation positions that must open a chapter regardless of
-    what the model decided; the pipeline passes the source-file joins.
+    `locked` are observation positions that must open a chapter regardless
+    of what the model decided; the pipeline passes the source-file joins.
     """
     n = len(observations)
     if n == 0:
-        return [], "failed"
+        return None
     end_time = duration_sec or observations[-1].t
     if n == 1:
-        return _events_from_chapters(
-            [{"start": 0, "title": "", "kind": "active", "why": ""}],
-            observations, video_id, end_time,
-        ), "llm"
+        return [{"start": 0, "title": "", "reason": "",
+                 "metadata": {"kind": "active"}}]
 
     if n > config.max_observations:
         print(f"[coalesce] WARNING: {n} observations exceeds "
@@ -447,29 +358,28 @@ def coalesce(
               f"ocr={'on' if config.include_ocr else 'off'})")
 
     try:
-        raw = _call_claude(prompt, config, api_key=api_key)
-    except Exception as exc:
-        print(f"[coalesce] failed ({exc!r})")
-        return [], "failed"
+        raw = _call_claude(prompt, config)
+    except llm.LLMError as exc:
+        print(f"[coalesce] failed ({exc})")
+        return None
 
     chapters = _validate_and_repair(
-        raw, observations, seg_config, end_time, locked=locked, verbose=verbose
+        raw, observations, min_event_sec, end_time, locked=locked, verbose=verbose
     )
-    events = _events_from_chapters(chapters, observations, video_id, end_time)
     if verbose:
-        print(f"  [coalesce] {len(raw)} proposed -> {len(events)} chapters")
-    return events, "llm"
+        print(f"  [coalesce] {len(raw)} proposed -> {len(chapters)} chapters")
+    return chapters
 
 
 if __name__ == "__main__":
-    # Standalone debug: coalesce a cached observations file. This is the loop
-    # worth having — Pass 1 is the expensive half, so iterating on Pass 2
-    # against a cache costs one call per attempt.
+    # Standalone debug: coalesce a cached observations file and print the
+    # decision, without touching the index. `cuts coalesce` is the real
+    # command; this is the quick look.
     import sys
 
+    from .chapters import join_positions
     from .config import CutsConfig
     from .observe import read_observations
-    from .schema import to_chapter_list
 
     if len(sys.argv) < 2:
         print("usage: python -m cuts.coalesce <observations.jsonl> [intent]")
@@ -478,16 +388,10 @@ if __name__ == "__main__":
     cfg = CutsConfig()
     if len(sys.argv) > 2:
         cfg.coalesce.intent = sys.argv[2]
-    obs, meta = read_observations(sys.argv[1])
+    obs, _meta = read_observations(sys.argv[1])
     print(f"{len(obs)} observations, {format_timestamp(obs[-1].t)} of footage")
-
-    evs, backend = coalesce(
-        obs, cfg.coalesce, cfg.segmentation,
-        duration_sec=obs[-1].t, verbose=True,
-    )
-    print(f"\nbackend: {backend}\n")
-    print(to_chapter_list(evs))
-    print()
-    for e in evs:
-        print(f"  {e.timestamp():>7} [{e.metadata.get('kind', '?'):>7}] "
-              f"{e.duration_sec / 60:5.1f}min  {e.summary}")
+    result = coalesce(obs, cfg.coalesce, cfg.segmentation.min_event_sec,
+                      locked=join_positions(obs), verbose=True)
+    for c in result or []:
+        print(f"  {format_timestamp(obs[c['start']].t):>7} "
+              f"[{c['metadata']['kind']:>7}] {c['title']}  — {c['reason']}")

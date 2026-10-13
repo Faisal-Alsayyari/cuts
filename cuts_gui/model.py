@@ -98,6 +98,14 @@ class Chapter:
         return self.title or "(untitled)"
 
 
+# Why a note has no description, by the backend's observation status.
+_MISSING = {
+    "withheld": "withheld — a credential was on screen, never uploaded",
+    "undecodable": "no frame at this time",
+    "failed": "description failed — re-analyze to retry",
+}
+
+
 @dataclass
 class Note:
     """One sampled frame and what was observed about it."""
@@ -110,9 +118,23 @@ class Note:
     transcript: str = ""
     # Names of credential patterns blacked out of this frame — never content.
     redacted: List[str] = field(default_factory=list)
-    # The frame was never described: a credential could not be localized, or
-    # no frame could be decoded at this time.
-    withheld: bool = False
+    # The backend's observation status: ok | withheld | undecodable | failed.
+    status: str = "ok"
+
+    @property
+    def withheld(self) -> bool:
+        """True when the frame has no description for a reason (see `missing`)."""
+        return self.status != "ok"
+
+    @property
+    def missing(self) -> str:
+        """Why this note has no description, or "" if it is not missing one."""
+        return _MISSING.get(self.status, "")
+
+    @property
+    def flagged(self) -> bool:
+        """A credential was on screen: blacked out, or the frame withheld."""
+        return bool(self.redacted) or self.status == "withheld"
 
 
 @dataclass

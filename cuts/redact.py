@@ -183,6 +183,26 @@ def redact_lines(
     return text, unlocalized is None, hits
 
 
+def scrub_text(
+    text: str, config: RedactConfig
+) -> Tuple[str, List[str]]:
+    """Replace credential matches in free text. Returns `(text, hits)`.
+
+    For text that never had pixels to paint over — the speech transcript,
+    which is sent to the coalescing and labeling calls verbatim. Matches are
+    replaced by `config.placeholder`; with redaction disabled the text is
+    returned unchanged.
+    """
+    if not text or not config.enabled:
+        return text, []
+    hits: List[str] = []
+    for name, pat in _patterns(config):
+        text, n = pat.subn(config.placeholder, text)
+        if n:
+            hits.append(name)
+    return text, hits
+
+
 def scrub_frame(
     img: np.ndarray,
     ocr_config: OCRConfig,
@@ -191,7 +211,7 @@ def scrub_frame(
 ) -> Tuple[str, bool, List[str]]:
     """OCR `img`, black out credentials **in place**, return grounding text.
 
-    The single chokepoint every upload path goes through. `img` is mutated,
+    The single chokepoint every frame upload goes through. `img` is mutated,
     which is intended: a redacted frame should stay redacted for whatever
     else touches it downstream.
 

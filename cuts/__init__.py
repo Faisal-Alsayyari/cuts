@@ -1,7 +1,8 @@
-"""cuts — frame-accurate shot boundary and UI state change event detection pipeline.
+"""cuts — semantic indexing and temporal navigation of long-form video.
 
-Public API surface is intentionally minimal; users should compose modules directly
-or invoke the orchestrator in `cuts.pipeline`. See README for usage.
+Turns long screen recordings into a titled chapter list. Run it with
+`python -m cuts chapters <video...>`; `cuts.pipeline.run` is the same thing
+as a function. See README for usage.
 """
 
 from cuts.config import CutsConfig  # re-export the single source-of-truth config

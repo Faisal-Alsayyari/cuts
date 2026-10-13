@@ -198,9 +198,10 @@ def _credentials_note(root: str) -> Optional[QLabel]:
     if backend.credentials_source(root):
         return None
     return _note(
-        "No ANTHROPIC_API_KEY found in the environment or a .env file. "
-        "Analysis will still run, but on the visual channel only, with rough "
-        "keyword titles. See Settings.", "Warning")
+        "No ANTHROPIC_API_KEY found in the environment or a .env file. The "
+        "default analysis needs it to describe frames and will refuse to "
+        "start; the Curve segmenter (Advanced) runs without it, on the visual "
+        "channel only, with rough keyword titles. See Settings.", "Warning")
 
 
 # ---------------------------------------------------------------------------
@@ -479,8 +480,8 @@ class RechapterDialog(QDialog):
         form.addRow("Chapter model", self.model)
         lay.addLayout(form)
         lay.addWidget(_note(
-            "Chapters from this quick pass skip boundary refinement and the "
-            "speech transcript; run a full analysis for those."))
+            "Uses the same transcript and boundary refinement as a full "
+            "analysis; only the frame reading is skipped."))
         btns = QDialogButtonBox(QDialogButtonBox.Cancel)
         go = btns.addButton("Re-chapter", QDialogButtonBox.AcceptRole)
         go.setObjectName("Primary")

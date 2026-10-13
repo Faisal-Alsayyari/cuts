@@ -199,6 +199,10 @@ def _notes_candidates(files: Sequence[str], index_path: str = "") -> List[str]:
         out.append(str(first.with_name(first.stem + NOTES_SUFFIX)))
         if index_path:
             out.append(str(Path(index_path).with_name(first.stem + NOTES_SUFFIX)))
+    if len(files) > 1:
+        # Multi-file caches are named like multi-file indexes: stem+N.
+        first = Path(files[0])
+        out.append(str(first.with_name(f"{first.stem}+{len(files) - 1}{NOTES_SUFFIX}")))
     if index_path and index_path.endswith(INDEX_SUFFIX):
         out.append(index_path[: -len(INDEX_SUFFIX)] + NOTES_SUFFIX)
     seen, uniq = set(), []
@@ -235,7 +239,8 @@ def _notes_match(path: str, files: Sequence[str]) -> Optional[str]:
         return (f"the notes file covers {len(cached)} file(s), "
                 f"this session has {len(files)}")
     for entry, f in zip(cached, files):
-        cpath, csize = entry[0], entry[2] if len(entry) > 2 else None
+        # [name, size] since cache version 2; [path, mtime, size] before.
+        cpath, csize = entry[0], entry[-1] if len(entry) > 1 else None
         if os.path.basename(cpath) != os.path.basename(f):
             return f"the notes file was made from {os.path.basename(cpath)}"
         if csize and os.path.exists(f) and os.path.getsize(f) != csize:
@@ -334,7 +339,7 @@ def load_index(session: Session) -> Index:
         "intent": extra.get("intent", ""),
         "samples": extra.get("n_samples") or extra.get("n_observations"),
         "signals": extra.get("channels", []),
-        "titles": extra.get("label_backend", ""),
+        "titles": extra.get("titles") or extra.get("label_backend", ""),
         "stage_times": extra.get("stage_times", {}),
     }
 
@@ -361,7 +366,7 @@ def _chapter(e: Dict[str, Any]) -> Chapter:
         end=float(e.get("end_time", 0.0)),
         title=str(e.get("title", "")).strip(),
         kind=str(meta.get("kind", "")).strip().lower(),
-        reason=str(e.get("summary", "")).strip(),
+        reason=str(e.get("reason") or e.get("summary") or "").strip(),
         descriptions=descriptions,
         transcript=str(e.get("transcript_text", "")).strip(),
         source_index=int(e.get("source_index", 0) or 0),
@@ -394,9 +399,14 @@ def _load_notes(
                     line = line.strip()
                     if not line:
                         continue
-                    d = json.loads(line)
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue          # the torn tail of an interrupted run
                     if "_meta" in d:
                         continue
+                    status = d.get("status") or (
+                        "withheld" if d.get("withheld") else "ok")
                     notes.append(Note(
                         t=float(d.get("t", 0.0)),
                         source_index=int(d.get("source_index", 0) or 0),
@@ -405,12 +415,15 @@ def _load_notes(
                         screen_text=str(d.get("ocr_text", "")),
                         transcript=str(d.get("transcript_text", "")).strip(),
                         redacted=list(d.get("redacted") or []),
-                        withheld=bool(d.get("withheld", False)),
+                        status=str(status),
                     ))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             reason = f"The per-frame notes file could not be read ({exc})."
             continue
-        notes.sort(key=lambda n: n.t)
+        # Later lines for the same sample replace earlier ones: the backend
+        # appends to this file as it works.
+        latest = {(n.source_index, round(n.source_time, 3)): n for n in notes}
+        notes = sorted(latest.values(), key=lambda n: n.t)
         return notes, path, ""
     return [], "", reason
 
@@ -477,8 +490,7 @@ class Signal:
 
 # Backend timing lines ("  [observe] 233.7s") name its own stages; this maps
 # them onto the GUI's.
-_TIMED = {"observe": "observe", "signals": "observe", "asr": "transcribe",
-          "coalesce": "chapter", "segmentation": "chapter",
+_TIMED = {"observe": "observe", "segment": "chapter",
           "refine": "refine", "labeling": "label"}
 
 _RULES: List[Tuple[re.Pattern, Any]] = [
@@ -491,8 +503,8 @@ _RULES: List[Tuple[re.Pattern, Any]] = [
      lambda m: Signal("stage", "observe",
                       f"Describing {m[2]} frames in {m[1]} shard(s)",
                       value=float(m[2]))),
-    (re.compile(r"^\s*\[sample\] every"),
-     lambda m: Signal("stage", "observe", "Sampling frames")),
+    (re.compile(r"^\s*\[observe\] (\d+)/(\d+) samples"),
+     lambda m: Signal("stage", "observe", f"Read {m[1]} of {m[2]} frames")),
     (re.compile(r"^\s*\[asr\] transcribing"),
      lambda m: Signal("stage", "transcribe", "Transcribing speech")),
     (re.compile(r"^\s*\[asr\] skipped"),
@@ -513,9 +525,9 @@ _RULES: List[Tuple[re.Pattern, Any]] = [
      lambda m: Signal("warning", "",
                       "Chaptering call failed; fell back to the curve "
                       "segmenter over the same notes")),
-    (re.compile(r"^\[pipeline\] no ANTHROPIC_API_KEY"),
+    (re.compile(r"^\[pipeline\] no Anthropic credentials"),
      lambda m: Signal("warning", "",
-                      "No ANTHROPIC_API_KEY: chapters are from the visual "
+                      "No API credentials: chapters are from the visual "
                       "channel only, with rough titles")),
     (re.compile(r"WARNING:?\s*(.+)"),
      lambda m: Signal("warning", "", m[1])),

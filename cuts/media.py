@@ -1,28 +1,24 @@
-"""Frame-accurate decoding and uniform temporal sampling via PyAV.
+"""Frame-accurate decoding and sampling via PyAV.
 
-This is the foundation of the pipeline. Every module that reasons about frame
-indices, PTS, or wall-clock times must do so via this module — never via
-`frame_idx / fps`, which is wrong for VFR (variable frame rate) content.
+Every module that reasons about timestamps must do so via this module — never
+via `frame_idx / fps`, which is wrong for VFR (variable frame rate) content.
 Screen recorders are a common source of VFR output, so this matters here.
 
-What this module guarantees:
+What this module provides:
 
-* `build_frame_index(path)` materializes `frame_idx -> (pts, time_sec)` in a
-  single decoding pass. This is the ground-truth lookup table for converting
-  between frame indices and wall-clock times.
-* `iter_sampled_frames(path, interval_sec)` streams one frame every
-  `interval_sec` seconds. This is the entry point for the whole semantic
-  pipeline (the EFS paper's "uniformly sampled at 1 fps" candidate set).
 * `iter_frames_at_times(path, times)` decodes the frame nearest each of a list
   of timestamps in one open, by seeking to each. This is the sampling
-  primitive for `cuts.observe` — see the performance note below for why it,
-  not `iter_sampled_frames`, is what makes sharded Pass 1 possible.
-* `decode_frames_at(path, indices)` pulls a specific set of frames in one pass,
-  for representative thumbnails after segmentation has run.
+  primitive for Pass 1 (`cuts.observe`) and for labeling's representative
+  frames.
+* `iter_sampled_frames(path, interval_sec)` streams one frame every
+  `interval_sec` by decoding sequentially — the `--no-seek` fallback for
+  footage where seeking is unreliable.
 * `decode_frame_near(path, time_sec)` seeks to one arbitrary timestamp for a
   single frame, for boundary refinement's occasional out-of-band look.
-* `Timeline` / `iter_timeline_frames` present *several* files as one continuous
-  virtual timeline, which is how a session split across days is analyzed.
+* `true_duration_sec(path)` confirms a file's real length against its last
+  frame, because some screen recorders under-report it in the header.
+* `Timeline` presents *several* files as one continuous virtual timeline,
+  which is how a session split across days is analyzed.
 
 Why a virtual timeline rather than concatenating the files with ffmpeg: a
 stream-copy concat only works when every input shares a codec, resolution and
@@ -33,38 +29,18 @@ merged file forgets which recording a moment came from, and "file 2 at
 14:22" is exactly what you need to actually go find the footage. Reading the
 files in sequence costs nothing extra and keeps that mapping.
 
-Memory note: `iter_sampled_frames` is a generator that yields full-resolution
-frames one at a time and never accumulates. Consumers are expected to batch a
-bounded number of them (see `SamplingConfig.batch_size`) and discard pixel data
-as soon as per-frame signals are extracted. Holding every sampled frame of even
-a 45-minute capture would exceed available memory on an 8 GB machine.
-
-Performance note: there are two sampling strategies here, and the difference
-between them is architectural rather than a micro-optimization.
-
-`iter_sampled_frames` decodes *every* frame and pays `to_ndarray()` (the
-expensive step) only on sampled ones. It is correct and simple, but its cost is
-linear in total video length rather than in sample count, and — the part that
-matters — linear in the video *before* the frames it wants. It cannot start in
-the middle.
-
-`iter_frames_at_times` seeks to each requested timestamp instead. Measured on
-an 87-minute 1080p screen capture (8.3s keyframe interval): flat at ~0.08s per
-sample whether the samples sit 5%, 50% or 95% through the file, landing within
-0.03s of the requested time. Sampling the whole file at 30s takes ~14s against
-~78s of full sequential decode, and because the cost does not grow with depth,
-independent workers can each cover their own time range. That is what
-`cuts.observe` is built on.
-
-Sequential decode remains the fallback for footage where seeking is unreliable
-(some VFR or fragmented containers), and is still what the `--segmenter curve`
-path uses.
+Performance note: `iter_frames_at_times` pays only for the frames it asks for.
+Measured on an 87-minute 1080p screen capture (8.3s keyframe interval): flat at
+~0.08s per sample whether the samples sit 5%, 50% or 95% through the file,
+landing within 0.03s of the requested time. Sampling the whole file at 30s
+takes ~14s against ~78s of full sequential decode, and because the cost does
+not grow with depth, independent workers can each cover their own time range.
+That is what `cuts.observe` is built on.
 """
 
 from __future__ import annotations
 
 import os
-import pickle
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -76,94 +52,21 @@ import numpy as np
 class SampledFrame:
     """One decoded video frame with everything downstream code needs."""
 
-    frame_idx: int        # ordinal index in decoding order, 0-based
+    frame_idx: int        # ordinal in decoding order; -1 for a seeked frame
     pts: int              # presentation timestamp in stream time_base units
     time_sec: float       # wall-clock time = pts * time_base, in seconds
     image: np.ndarray     # HxWx3 BGR uint8 (matches OpenCV conventions)
 
 
 # ---------------------------------------------------------------------------
-# Lookup table: frame_idx -> (pts, time_sec)
-# ---------------------------------------------------------------------------
-
-def build_frame_index(
-    video_path: str, cache_dir: Optional[str] = None
-) -> List[Tuple[int, float]]:
-    """Single-pass scan to build the frame_idx -> (pts, time_sec) table.
-
-    This is intentionally a *decode-light* pass: we still decode (PyAV does not
-    expose per-frame PTS without decoding for many codecs reliably), but we
-    discard the pixel data immediately, which is where the cost is.
-    """
-    cache_path = _cache_path_for(video_path, cache_dir)
-    if cache_path is not None and os.path.exists(cache_path):
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
-    container = av.open(video_path)
-    table: List[Tuple[int, float]] = []
-    try:
-        stream = container.streams.video[0]
-        time_base = stream.time_base
-        for frame in container.decode(stream):
-            pts = frame.pts if frame.pts is not None else (frame.dts or 0)
-            table.append((int(pts), float(pts * time_base)))
-    finally:
-        container.close()
-
-    if cache_path is not None:
-        # Best-effort cache write; failure here is non-fatal.
-        try:
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            with open(cache_path, "wb") as f:
-                pickle.dump(table, f)
-        except OSError:
-            pass
-
-    return table
-
-
-def _cache_path_for(video_path: str, cache_dir: Optional[str]) -> Optional[str]:
-    """Return the cache file path for `video_path`, or None if caching is off.
-
-    Keyed on absolute path + mtime + size so re-encoding the same path
-    invalidates the cache automatically.
-    """
-    if cache_dir is None:
-        return None
-    abs_path = os.path.abspath(video_path)
-    try:
-        st = os.stat(abs_path)
-    except OSError:
-        return None
-    key = f"{abs_path.replace(os.sep, '_')}__{int(st.st_mtime)}__{st.st_size}.pkl"
-    return os.path.join(cache_dir, "frame_index", key)
-
-
-# ---------------------------------------------------------------------------
 # Stream metadata helpers
 # ---------------------------------------------------------------------------
-
-def get_fps(video_path: str) -> float:
-    """Return the average frame rate as a float.
-
-    For VFR content this is only an *average* — never use it to compute
-    per-frame timestamps; use the frame index table for that.
-    """
-    container = av.open(video_path)
-    try:
-        stream = container.streams.video[0]
-        rate = stream.average_rate or stream.base_rate
-        return float(rate) if rate else 0.0
-    finally:
-        container.close()
-
 
 def get_duration_sec(video_path: str) -> float:
     """Return container-reported duration in seconds (0.0 when unavailable).
 
-    Cheap (no decoding). Use `build_frame_index()[-1][1]` when exactness
-    matters; this is for progress estimation and sizing decisions.
+    Cheap (no decoding), but only as good as the header. Use
+    `true_duration_sec` when the real extent matters.
     """
     container = av.open(video_path)
     try:
@@ -182,11 +85,9 @@ def true_duration_sec(
 ) -> float:
     """Duration confirmed against the actual last frame, not just the header.
 
-    `iter_timeline_frames` treats the container's claim as a floor because some
-    screen recorders under-report it, and it can afford to: it discovers each
-    file's true extent while streaming through it. Sharded observation
-    (`cuts.observe`) never streams the whole file, so it has to establish the
-    extent up front or it would silently never sample the tail.
+    Some screen recorders under-report the duration in the header. Sharded
+    observation (`cuts.observe`) never streams the whole file, so it has to
+    establish the extent up front or it would silently never sample the tail.
 
     Cheap: seek to `probe_sec` before the claimed end and decode to EOF —
     measured at ~0.1s on hour-long 1080p capture. Returns whichever of the
@@ -205,7 +106,7 @@ def true_duration_sec(
         try:
             container.seek(int(max(0.0, reported - probe_sec) / time_base),
                            stream=stream, backward=True, any_frame=False)
-        except av.AVError:
+        except av.FFmpegError:
             return reported
         last = 0.0
         for frame in container.decode(stream):
@@ -235,7 +136,7 @@ def has_audio(video_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Uniform temporal sampling — the entry point for the semantic pipeline
+# Sequential sampling — the fallback when seeking is unreliable
 # ---------------------------------------------------------------------------
 
 def iter_sampled_frames(
@@ -243,7 +144,11 @@ def iter_sampled_frames(
     interval_sec: float = 1.0,
     max_frames: Optional[int] = None,
 ) -> Iterator[SampledFrame]:
-    """Yield one frame every `interval_sec` seconds of wall-clock time.
+    """Yield one frame every `interval_sec` seconds, by sequential decode.
+
+    The `--no-seek` fallback (and the debug entry points). Cost is linear in
+    the video length *before* the frames it wants, so prefer
+    `iter_frames_at_times` everywhere seeking works.
 
     Sampling is driven by each frame's true PTS-derived timestamp rather than
     by a frame-count stride, so the spacing stays correct under VFR. The first
@@ -302,22 +207,15 @@ def iter_sampled_frames(
 class Source:
     """One input file's placement on the global timeline.
 
-    `time_offset` and `frame_offset` convert this file's local coordinates into
-    global ones: ``global = local + offset``. Both are finalized by
-    `iter_timeline_frames`, since the true extent of a file is only known once
-    it has been read.
-
-    `frame_span` is one past the last frame index this source contributed, so
-    global frame ranges are ``[frame_offset, frame_offset + frame_span)`` and
-    never overlap between sources.
+    ``global time = time_offset + local time``. `Timeline.build` lays files
+    out from their header durations; `cuts.observe.confirm_durations`
+    re-lays them on each file's true extent before anything is sampled.
     """
 
     path: str
     index: int
     duration_sec: float = 0.0
     time_offset: float = 0.0
-    frame_offset: int = 0
-    frame_span: int = 0
 
     @property
     def name(self) -> str:
@@ -333,8 +231,6 @@ class Source:
             "index": self.index,
             "duration_sec": self.duration_sec,
             "time_offset": self.time_offset,
-            "frame_offset": self.frame_offset,
-            "frame_span": self.frame_span,
         }
 
     @classmethod
@@ -389,17 +285,6 @@ class Timeline:
     def first_path(self) -> str:
         return self.sources[0].path
 
-    def source_for_frame(self, global_frame: int) -> Optional[Source]:
-        for s in self.sources:
-            if s.frame_offset <= global_frame < s.frame_offset + s.frame_span:
-                return s
-        return None
-
-    def local_frame(self, global_frame: int) -> Optional[Tuple[Source, int]]:
-        """Map a global frame index back to (source, local frame index)."""
-        s = self.source_for_frame(global_frame)
-        return None if s is None else (s, global_frame - s.frame_offset)
-
     def source_for_time(self, global_time: float) -> Source:
         """Map a global timestamp to the source that contains it.
 
@@ -422,53 +307,6 @@ class Timeline:
     @classmethod
     def from_dicts(cls, ds: Iterable[Dict[str, object]]) -> "Timeline":
         return cls(sources=[Source.from_dict(d) for d in ds])
-
-
-def iter_timeline_frames(
-    timeline: Timeline,
-    interval_sec: float = 1.0,
-) -> Iterator[Tuple[SampledFrame, Source]]:
-    """Stream every source in order as one continuous sampled timeline.
-
-    Yields ``(frame, source)`` where the frame's `frame_idx` and `time_sec`
-    have already been shifted into global coordinates, so downstream code that
-    only understands "one long video" needs no changes at all.
-
-    Offsets are assigned *during* iteration rather than up front, from each
-    file's last observed sample time. Container-reported duration is used as a
-    floor, not as the truth: some screen recorders under-report it, and taking
-    it at face value would make later files overlap earlier ones and produce
-    non-monotonic timestamps.
-    """
-    frame_cursor = 0
-    time_cursor = 0.0
-
-    for src in timeline.sources:
-        src.frame_offset = frame_cursor
-        src.time_offset = time_cursor
-
-        last_local_frame = -1
-        last_local_time = 0.0
-
-        for sf in iter_sampled_frames(src.path, interval_sec=interval_sec):
-            last_local_frame = sf.frame_idx
-            last_local_time = sf.time_sec
-            yield (
-                SampledFrame(
-                    frame_idx=src.frame_offset + sf.frame_idx,
-                    pts=sf.pts,
-                    time_sec=src.time_offset + sf.time_sec,
-                    image=sf.image,
-                ),
-                src,
-            )
-
-        src.frame_span = last_local_frame + 1
-        # The file extends at least to its last sampled frame; keep whichever
-        # of that and the container's claim is larger.
-        src.duration_sec = max(src.duration_sec, last_local_time)
-        frame_cursor = src.frame_offset + src.frame_span
-        time_cursor = src.time_offset + src.duration_sec
 
 
 def probe_video(video_path: str) -> Dict[str, object]:
@@ -536,7 +374,7 @@ def decode_frame_near(
         target_pts = int(target_time_sec / time_base)
         try:
             container.seek(target_pts, stream=stream, backward=True, any_frame=False)
-        except av.AVError:
+        except av.FFmpegError:
             return None
 
         for i, frame in enumerate(container.decode(stream)):
@@ -585,6 +423,9 @@ def iter_frames_at_times(
     As everywhere else in this module, timestamps are ``pts * time_base``.
     `frame_idx` is -1: a seeked frame has no meaningful ordinal, which is why
     `cuts.observe` keys on time instead.
+
+    Frames are yielded as they are decoded, so a consumer that processes and
+    drops each one holds a single full-resolution frame at a time.
     """
     targets = sorted(float(t) for t in times)
     if not targets:
@@ -607,7 +448,7 @@ def iter_frames_at_times(
                 try:
                     container.seek(int(target / time_base), stream=stream,
                                    backward=True, any_frame=False)
-                except av.AVError:
+                except av.FFmpegError:
                     yield (target, None)
                     decoder, cur_t = None, -1.0
                     continue
@@ -639,38 +480,6 @@ def iter_frames_at_times(
         container.close()
 
 
-def decode_frames_at(
-    video_path: str, indices: Iterable[int]
-) -> Dict[int, np.ndarray]:
-    """Decode a specific set of frame indices in ONE sequential pass.
-
-    The naive alternative — reopening the video per index — is O(N x length).
-    This opens once, materializes only the requested frames, and stops as soon
-    as the last one is reached.
-
-    Used after segmentation to pull representative thumbnails for labeling.
-    """
-    wanted = sorted(set(int(i) for i in indices))
-    if not wanted:
-        return {}
-    wanted_set = set(wanted)
-    global_end = wanted[-1]
-
-    out: Dict[int, np.ndarray] = {}
-    container = av.open(video_path)
-    try:
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
-        for i, frame in enumerate(container.decode(stream)):
-            if i > global_end:
-                break
-            if i in wanted_set:
-                out[i] = frame.to_ndarray(format="bgr24")
-    finally:
-        container.close()
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Image helpers shared by every signal extractor
 # ---------------------------------------------------------------------------
@@ -695,7 +504,7 @@ def resize_long_edge(img: np.ndarray, long_edge: int) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    # Standalone debug: print metadata and walk the timeline.
+    # Standalone debug: print metadata, then seek-sample each file.
     import sys
     import time
 
@@ -712,17 +521,12 @@ if __name__ == "__main__":
 
     tl = Timeline.build(paths)
     print(f"\ntimeline: {len(tl)} source(s), {tl.duration_sec:.1f}s total")
-
-    t0 = time.time()
-    n = 0
-    last_t = 0.0
-    for sf, src in iter_timeline_frames(tl, interval_sec=1.0):
-        if n < 3:
-            print(f"  sample {n}: global_frame={sf.frame_idx} "
-                  f"t={sf.time_sec:.3f}s from {src.name} shape={sf.image.shape}")
-        last_t = sf.time_sec
-        n += 1
-    print(f"sampled {n} frames (last t={last_t:.2f}s) in {time.time() - t0:.2f}s")
     for s in tl.sources:
-        print(f"  {s.name}: t+{s.time_offset:.1f}s frames "
-              f"[{s.frame_offset}, {s.frame_offset + s.frame_span})")
+        true_dur = true_duration_sec(s.path, hint=s.duration_sec)
+        times = [t for t in range(0, int(true_dur), 30)]
+        t0 = time.time()
+        got = [(t, f) for t, f in iter_frames_at_times(s.path, times)]
+        landed = [abs(f.time_sec - t) for t, f in got if f is not None]
+        print(f"  {s.name}: true length {true_dur:.1f}s, {len(got)} samples, "
+              f"{len(landed)} landed (max error "
+              f"{max(landed) if landed else 0:.3f}s) in {time.time() - t0:.2f}s")

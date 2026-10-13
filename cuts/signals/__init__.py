@@ -1,15 +1,13 @@
 """Per-frame signal extractors.
 
-Each module here turns sampled frames into one *channel* of evidence about
-what is happening on screen at a given time:
+Each module here turns sampled frames (or the audio track) into one kind of
+evidence about what is happening on screen:
 
-    dino.py  -> visual embeddings   (DINOv2; the EFS paper's channel)
-    vlm.py   -> on-screen text      (Claude vision description; usually dominant for screen capture)
-    ocr.py   -> (not a channel) local OCR, grounds vlm.py's description call
-                with exact strings a downscaled image can't reliably carry
-    asr.py   -> spoken transcript   (faster-whisper; optional, audio permitting)
-
-`cuts.segmentation` fuses whichever channels are available into a single
-temporal similarity curve, so any one of them can be disabled without the
-rest of the pipeline changing shape.
+    vlm.py   -> one-sentence screen descriptions (Claude vision; the evidence
+                Pass 2 reads, and the curve segmenter's text channel)
+    ocr.py   -> (not a channel) local OCR that grounds vlm.py's call with exact
+                strings, and gives cuts.redact the boxes it paints over
+    dino.py  -> visual embeddings (DINOv2; curve segmenter only)
+    asr.py   -> spoken transcript (faster-whisper; optional, audio permitting)
+    text_features.py -> TF-IDF vectors for the curve segmenter's text channels
 """

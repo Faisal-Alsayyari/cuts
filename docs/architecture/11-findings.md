@@ -5,6 +5,46 @@ Everything here was found by reading the code at `6c551be`. Items marked
 environment; everything else is established from the source alone and was
 not executed. Severity reflects impact on the default `chapters` run.
 
+## Resolution status
+
+Addressed on branch `refactor/unify-pipeline`; see
+[12-unified-pipeline.md](12-unified-pipeline.md) for the resulting
+architecture. Each fix is covered by a test in `tests/`, except where noted.
+
+| Finding | Resolution |
+|---------|------------|
+| 1.1 failed descriptions cached | `describe_frames` returns `None` per failed frame. The observation is `failed` and retried on the next run. A status summary is always printed. |
+| 1.2 no credentials on default path | `pipeline.preflight` exits with `error:` before decoding. README and GUI text corrected. |
+| 1.3 `av.AVError` | Now `av.FFmpegError`; `av>=14` pinned. Not unit-tested (needs a seek failure). |
+| 1.4 all-or-nothing Pass 1 | Per-shard append to the cache; shard exceptions are isolated; resume does only missing work. |
+| 1.5 offsets on cache hit | `confirm_durations` runs on every run; confirmed `sources` are stored in the cache meta. |
+| 1.6 refinement batching | Midpoints are described one per call. |
+| 1.7 `--no-labels` | Only disables the separate titling call. |
+| 1.8 `cuts coalesce` | Runs the same `chapters_from_observations` as `chapters`; timeline comes from the cache meta. |
+| 1.9 `cuts label` drops `extra` | `extra` is preserved; `titles` is updated. |
+| 1.10 GUI log freeze | `RunState.total_lines` / `lines_since`. |
+| 1.11 trailing sample | Grid is strictly `< duration`. |
+| §4.1 two pipelines | One pipeline; curve runs on Pass 1 observations (DINOv2 embeddings cached). |
+| §4.2 `label_backend` overloaded | Split into `segmenter` and `titles`; `--backend` honoured everywhere titles are generated. |
+| §4.3 `summary` holds `why` | `Event.reason`; legacy `summary` is read as `reason`. |
+| §4.4 `withheld` means two things | `Observation.status`: ok / failed / withheld / undecodable. |
+| §4.5 credential detection | `llm.has_credentials()` everywhere (asks the SDK). |
+| §4.6 concurrency knobs | One global cap, `LLMConfig.max_concurrency`, and one shared client. |
+| §4.7 requested vs actual time | Documented as intended: `t` is the grid time, its cache identity. |
+| §4.8 private cross-module imports | Shared helpers moved to `cuts/chapters.py` and made public. |
+| §4.9 cache identity GUI vs backend | Both match files on (name, size). |
+| §4.10 transcripts not redacted | `redact.scrub_text` on every transcript segment. |
+| §4.11 filmstrip unredacted | Filmstrip pixelates frames near flagged notes (`thumbs.pixelate`). |
+| §4.12 documentation drift | README, module docstrings and this directory updated. Documents 02–10 still describe the pre-refactor internals. |
+| §3 unused code | Deleted (see 12 §1). |
+| §6 unpinned / undeclared deps | Minimum versions pinned; `curve`, `gui` and `dev` extras; `cuts-gui` script. |
+| §6 large untracked artefacts | `OmniShotCut/`, `checkpoints/`, `cuts.egg-info/` and orphaned bytecode directories under `cuts/` deleted (~210 MB). Output of earlier runs (`retrieval_index/`, `refine_experiment/`, `dummy.json`) kept locally and added to `.gitignore`, together with every file the tool writes: `*.events.json` and its `.events_*.json` temp file, `*.observations.jsonl` and its `.tmp`, and GUI-saved `*.chapters.txt`. |
+| New: curve boundary one sample early | Found by the new tests. On a clean cut the symmetric dip let codec noise pick the sample *before* the cut about half the time. `segmentation.snap_to_cuts` puts the boundary after the sharpest adjacent pair. |
+
+Not addressed here: the incomplete features in §2 (agent layer, windowed
+coalescing, titles for validator-inserted chapters) and the bottlenecks in §5
+other than OCR-only-when-uploading and the global request cap.
+
 ## Summary
 
 | # | Finding | Severity | Area |
@@ -165,7 +205,7 @@ frame's pts. A request at that time finds no frame `>= target` and yields
 |---------|----------|-------|
 | Agent layer (`zoom(t0,t1,n)`, `get_ocr(t0,t1)`) | README "What this is not"; `Shard.sample_times` design; `resume_window_sec` | No tools, no loop, no `get_ocr`. See [08 §6](08-llm-integration.md#6-agentic-functionality-what-exists). |
 | Query-driven retrieval (EFS stages 2–3) | `cuts/select.py` | Implemented but unreachable; undeclared `open_clip` dependency; no adapter for LLM-path data. |
-| Text search (BM25 + embeddings + RRF) | `SearchConfig` (`config.py:449`), `retrieval_index/` artefacts, `sentence_transformers` in venv | Code removed; config and artefacts remain. |
+| Text search (BM25 + embeddings + RRF) | `SearchConfig` (`config.py:449`), `retrieval_index/` artefacts, `sentence_transformers` in venv | Code removed; config and artefacts remain. *Since: `SearchConfig` deleted; `retrieval_index/` kept locally as an ignored run artifact.* |
 | Footage cutting using `kind` | `coalesce.py:55-58` | `kind` produced and coloured in the GUI; nothing consumes it. |
 | Windowed coalescing for >1500 observations | `CoalesceConfig.max_observations` | Only a warning; no windowing. |
 | Per-event labeling mode | `LabelingConfig.batch_all_events` | Field never read. |
@@ -276,6 +316,7 @@ frame's pts. A request at that time finds no frame `>= target` and yields
 - **Large untracked artefacts** in the working tree (`OmniShotCut/`,
   `checkpoints/`, `retrieval_index/` ≈ 620 MB together), plus stale
   `cuts.egg-info/` and `dummy.json`, all from removed features.
+  *Since resolved; see the resolution table.*
 - **`print`-based logging** everywhere, which the GUI parses with regexes
   for progress. Any wording change degrades GUI progress display (the GUI
   documents this risk itself).

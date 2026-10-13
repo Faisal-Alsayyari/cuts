@@ -97,10 +97,3 @@ def text_features(
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     np.divide(mat, norms, out=mat, where=norms > 0)
     return mat
-
-
-def adjacent_similarity(features: np.ndarray) -> np.ndarray:
-    """Cosine similarity between consecutive rows. Assumes L2-normalized input."""
-    if len(features) < 2 or features.shape[1] == 0:
-        return np.zeros(max(0, len(features) - 1), dtype=np.float32)
-    return np.sum(features[:-1] * features[1:], axis=1).astype(np.float32)

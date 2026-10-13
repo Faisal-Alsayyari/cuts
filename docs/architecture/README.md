@@ -1,8 +1,12 @@
 # CUTS — Architecture Documentation
 
-This directory describes how the CUTS codebase **actually works** as of commit
-`6c551be` ("events coalescing, optimizations, and gui v1"), based on a
-read-only trace of every source file in `cuts/` and `cuts_gui/`. Where the
+This directory describes how the CUTS codebase **actually works**. Documents
+01–11 are a read-only trace of every source file at commit `6c551be`
+("events coalescing, optimizations, and gui v1"). The pipeline was then
+unified on branch `refactor/unify-pipeline`:
+**[12-unified-pipeline.md](12-unified-pipeline.md) describes the current
+architecture**, and [11-findings.md](11-findings.md#resolution-status) tracks
+how each finding was resolved. Where the
 code and the top-level [README](../../README.md) or in-code docstrings
 disagree, these documents follow the code and point out the disagreement.
 
@@ -38,9 +42,10 @@ visualises the results.
 | 8 | [08-llm-integration.md](08-llm-integration.md) | Every Claude API call: prompts, schemas, models, failure handling. Also: the state of "agentic" functionality |
 | 9 | [09-gui.md](09-gui.md) | `cuts_gui`: process boundary, job runner, log parsing, library, player, timeline |
 | 10 | [10-concurrency-caching-errors.md](10-concurrency-caching-errors.md) | Cross-cutting view of threads, pools, caches and failure modes |
-| 11 | [11-findings.md](11-findings.md) | **Bugs, incomplete features, dead code, inconsistencies, bottlenecks, technical debt**, ranked |
+| 11 | [11-findings.md](11-findings.md) | **Bugs, incomplete features, dead code, inconsistencies, bottlenecks, technical debt**, ranked — with their resolution status |
+| 12 | [12-unified-pipeline.md](12-unified-pipeline.md) | **The current architecture** after the refactor: one pipeline, resumable Pass 1, shared LLM layer, format changes, tests |
 
-If you only have half an hour, read 01, 02 and 11.
+If you only have half an hour, read 01, 12 and 11.
 
 ## System at a glance
 

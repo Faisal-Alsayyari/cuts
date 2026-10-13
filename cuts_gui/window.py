@@ -609,8 +609,7 @@ class MainWindow(QMainWindow):
         ni = ix.note_at(t)
         if ni >= 0:
             n = ix.notes[ni]
-            body = n.description or ("withheld — not described" if n.withheld
-                                     else "")
+            body = n.description or n.missing
             self.cap_note.setText(f"{format_time(n.t)}  {body}")
         else:
             self.cap_note.setText("")

@@ -16,22 +16,28 @@ before assuming either dominates.
 
 Embeddings are L2-normalized on the way out, so cosine similarity between two
 frames is a plain dot product.
+
+Only the curve segmenter uses this channel. Pass 1 (`cuts.observe`) computes
+an embedding per sampled frame when the curve segmenter asks for one and
+caches it alongside that frame's observation.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+import threading
+from typing import List, Optional
 
 import numpy as np
 
 from ..config import DinoConfig
-from ..media import SampledFrame
 
 
 # Module-level singleton — model init is heavy (weights download on first use)
-# and we do not want to pay it per batch.
+# and we do not want to pay it per batch. Shard threads share it, so creation
+# is locked: two threads racing on first use would each load the weights.
 _MODEL = None
 _MODEL_KEY: Optional[tuple] = None
+_MODEL_LOCK = threading.Lock()
 
 
 def _get_model(config: DinoConfig, device: str):
@@ -39,60 +45,44 @@ def _get_model(config: DinoConfig, device: str):
     global _MODEL, _MODEL_KEY
 
     key = (config.model_name, device)
-    if _MODEL is not None and _MODEL_KEY == key:
+    with _MODEL_LOCK:
+        if _MODEL is not None and _MODEL_KEY == key:
+            return _MODEL
+
+        try:
+            import torch
+            from transformers import AutoImageProcessor, AutoModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "the curve segmenter's visual channel needs torch and "
+                "transformers (pip install 'cuts[curve]'), or pass --no-dino"
+            ) from exc
+
+        processor = AutoImageProcessor.from_pretrained(config.model_name)
+        model = AutoModel.from_pretrained(config.model_name)
+        model.eval().to(device)
+        # Inference only — no gradients anywhere in this pipeline.
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        _MODEL = (model, processor, torch)
+        _MODEL_KEY = key
         return _MODEL
 
-    import torch
-    from transformers import AutoImageProcessor, AutoModel
 
-    processor = AutoImageProcessor.from_pretrained(config.model_name)
-    model = AutoModel.from_pretrained(config.model_name)
-    model.eval().to(device)
-    # Inference only — no gradients anywhere in this pipeline.
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    _MODEL = (model, processor, torch)
-    _MODEL_KEY = key
-    return _MODEL
-
-
-def embed_frames(
-    frames: Sequence[SampledFrame],
+def embed_images(
+    images,
     config: DinoConfig,
     device: str = "cpu",
     batch_size: int = 16,
     verbose: bool = False,
 ) -> np.ndarray:
-    """Embed a sequence of sampled frames.
+    """Embed BGR images from an iterable, `batch_size` at a time.
 
     Returns an ``(N, D)`` float32 array of L2-normalized embeddings, row i
-    corresponding to ``frames[i]``. Returns shape ``(0, 0)`` for empty input.
-
-    The whole sequence is embedded in one call, so the caller must keep the
-    frame list to a size that fits in memory. For long videos prefer
-    `embed_stream`, which consumes an iterator and never holds more than
-    `batch_size` frames at once.
-    """
-    if not frames:
-        return np.zeros((0, 0), dtype=np.float32)
-    return embed_stream(
-        iter(frames), config, device=device, batch_size=batch_size, verbose=verbose
-    )
-
-
-def embed_stream(
-    frames,
-    config: DinoConfig,
-    device: str = "cpu",
-    batch_size: int = 16,
-    verbose: bool = False,
-) -> np.ndarray:
-    """Embed frames from an iterator, holding at most `batch_size` at a time.
-
-    This is the memory-safe path for long videos: the caller can hand us the
-    output of `media.iter_sampled_frames` directly and peak pixel memory stays
-    bounded regardless of video length.
+    corresponding to the i-th image, or shape ``(0, 0)`` for empty input.
+    The caller is expected to have downscaled the images first
+    (`SamplingConfig.frame_long_edge`).
     """
     import cv2
 
@@ -125,9 +115,9 @@ def embed_stream(
             print(f"    embedded {n_done} frames")
         batch = []
 
-    for sf in frames:
+    for img in images:
         # cv2 gives BGR; DINOv2's processor expects RGB.
-        batch.append(cv2.cvtColor(sf.image, cv2.COLOR_BGR2RGB))
+        batch.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         if len(batch) >= batch_size:
             _flush()
     _flush()
@@ -137,28 +127,6 @@ def embed_stream(
     return np.concatenate(out_chunks, axis=0)
 
 
-def cosine_similarity_matrix(embeddings: np.ndarray) -> np.ndarray:
-    """Full pairwise cosine similarity. Assumes rows are already L2-normalized.
-
-    Only used for small candidate sets (e.g. MMR redundancy in `cuts.select`);
-    segmentation never needs the full N x N matrix.
-    """
-    if embeddings.size == 0:
-        return np.zeros((0, 0), dtype=np.float32)
-    return embeddings @ embeddings.T
-
-
-def adjacent_similarity(embeddings: np.ndarray) -> np.ndarray:
-    """Cosine similarity between each consecutive pair of embeddings.
-
-    Returns a length ``N-1`` array where element i is ``cos(emb[i], emb[i+1])``.
-    This is the raw material for the EFS temporal similarity curve.
-    """
-    if len(embeddings) < 2:
-        return np.zeros(0, dtype=np.float32)
-    return np.sum(embeddings[:-1] * embeddings[1:], axis=1).astype(np.float32)
-
-
 if __name__ == "__main__":
     # Standalone debug: embed a video's sampled frames and report timing +
     # how discriminative the embeddings actually are on this footage.
@@ -166,7 +134,7 @@ if __name__ == "__main__":
     import time
 
     from ..config import CutsConfig
-    from ..media import iter_sampled_frames
+    from ..media import iter_sampled_frames, resize_long_edge
 
     if len(sys.argv) < 2:
         print("usage: python -m cuts.signals.dino <video_path> [interval_sec]")
@@ -177,8 +145,9 @@ if __name__ == "__main__":
     print(f"model:  {cfg.dino.model_name}")
     print(f"device: {cfg.device}")
     t0 = time.time()
-    emb = embed_stream(
-        iter_sampled_frames(sys.argv[1], interval_sec=interval),
+    emb = embed_images(
+        (resize_long_edge(sf.image, cfg.sampling.frame_long_edge)
+         for sf in iter_sampled_frames(sys.argv[1], interval_sec=interval)),
         cfg.dino,
         device=cfg.device,
         batch_size=cfg.sampling.batch_size,
@@ -186,7 +155,7 @@ if __name__ == "__main__":
     )
     print(f"embeddings: {emb.shape} in {time.time() - t0:.2f}s")
     if len(emb) >= 2:
-        adj = adjacent_similarity(emb)
+        adj = np.sum(emb[:-1] * emb[1:], axis=1)
         print(f"adjacent cosine: min={adj.min():.4f} mean={adj.mean():.4f} "
               f"max={adj.max():.4f}")
         print("  (a narrow range here means DINO is NOT discriminating this "

@@ -1,5 +1,7 @@
 # 01 — Overview: layout, dependencies, entry points
 
+> **Pre-refactor.** This document describes the code at `c39a118`. The pipeline was since unified on branch `refactor/unify-pipeline`; see [12-unified-pipeline.md](12-unified-pipeline.md) for what changed.
+
 ## 1. Repository layout
 
 ### Tracked source (what `git ls-files` returns)
@@ -51,18 +53,21 @@ module instead has an `if __name__ == "__main__":` debug entry point
 
 ### Untracked / ignored material in the working tree
 
-These are present on disk but are not part of the current system. Nothing in
-`cuts/` or `cuts_gui/` reads them.
+At the time of this snapshot these were on disk but not part of the system;
+nothing in `cuts/` or `cuts_gui/` read them. The **Now** column records the
+cleanup done since: leftovers of removed features were deleted, and output of
+earlier runs was kept but added to `.gitignore`.
 
-| Path | Size | What it is |
-|------|------|-----------|
-| `OmniShotCut/` | 53 MB | Third-party shot-boundary model code (`architecture/`, `test_code/inference.py`, `app.py`). Removed from the pipeline in commit `84a4a9c` ("Remove AutoShot/OmniShotCut arms"). |
-| `checkpoints/OmniShotCut_ckpt.pth` | 157 MB | Weights for the above (ignored by `*.pth` in `.gitignore`). |
-| `retrieval_index/(1) setting up thoughts/` | 407 MB | `bm25.pkl`, `text_emb.npy`, `segments.json`, `frames/`, `ocr_debug/` — output of a removed text-search feature. Its only trace in code is the unused `SearchConfig` (`cuts/config.py:449`). |
-| `refine_experiment/thumbnails/` | 6 MB | PNGs named `boundary_NNN_coarse_*.png` — an earlier refinement experiment. |
-| `dummy.json` | 83 B | `{"video_path": ..., "cuts": []}` — the output format of the pre-pivot shot-detection tool. |
-| `cuts.egg-info/` | — | Stale build metadata from April; its `requires.txt` lists `scenedetect`, `scikit-image`, `pandas`, `matplotlib`, none of which the code uses. |
-| `.venv/` | — | Local virtualenv (see §3). |
+| Path | Size | What it is | Now |
+|------|------|-----------|-----|
+| `OmniShotCut/` | 53 MB | Clean clone of the third-party shot-boundary repo (`UVA-Computer-Vision-Lab/OmniShotCut`). Removed from the pipeline in commit `84a4a9c` ("Remove AutoShot/OmniShotCut arms"). | Deleted |
+| `checkpoints/OmniShotCut_ckpt.pth` | 157 MB | Weights for the above (ignored by `*.pth` in `.gitignore`). | Deleted (re-downloadable from Hugging Face) |
+| `cuts.egg-info/` | — | Stale build metadata from April; its `requires.txt` lists `scenedetect`, `scikit-image`, `pandas`, `matplotlib`, none of which the code uses. | Deleted |
+| `cuts/benchmark/`, `cuts/detectors/`, `cuts/retrieval/` | — | Ignored directories holding only orphaned `.pyc` bytecode of modules deleted long ago. | Deleted |
+| `retrieval_index/(1) setting up thoughts/` | 407 MB | `bm25.pkl`, `text_emb.npy`, `segments.json`, `frames/`, `ocr_debug/` — output of a removed text-search feature. Its only trace in code was the unused `SearchConfig`. | Kept; ignored as a run artifact |
+| `refine_experiment/thumbnails/` | 6 MB | PNGs named `boundary_NNN_coarse_*.png` — an earlier refinement experiment. | Kept; ignored as a run artifact |
+| `dummy.json` | 83 B | `{"video_path": ..., "cuts": []}` — the output format of the pre-pivot shot-detection tool. | Kept; ignored as a run artifact |
+| `.venv/` | — | Local virtualenv (see §3). | Unchanged |
 
 ## 2. Declared dependencies
 

@@ -4,18 +4,17 @@
     python -m cuts probe <video...>               # what a run would cost
     python -m cuts observe <video...>             # Pass 1 -> observations.jsonl
     python -m cuts coalesce <observations.jsonl>  # Pass 2 -> events.json
-    python -m cuts label <events.json> [backend]  # (re)label an existing index
+    python -m cuts label <events.json> [backend]  # (re)title an existing index
 
-`chapters` is the primary command and the product's whole surface today: point
-it at a recording, get back a timestamped chapter list you can paste into a
-description or an editor's marker track. It runs both passes.
+`chapters` is the primary command: point it at a recording, get back a
+timestamped chapter list you can paste into a description or an editor's
+marker track. It runs both passes.
 
-`observe` and `coalesce` are those two passes on their own, and splitting them
-is what makes the system workable in practice. Observing is the expensive half
-and does not depend on how the footage is later carved up, so it is cached;
-coalescing is one call over that cache. Iterating on chapter quality — a
-different `--intent`, a different model — then costs one call instead of a
-full re-analysis.
+`observe` and `coalesce` are those two passes on their own. Observing is the
+expensive half and does not depend on how the footage is later carved up, so
+it is cached (and resumable); `coalesce` runs everything after Pass 1 against
+that cache — the same code `chapters` runs — so iterating on chapter quality
+with a different `--intent` or model costs one call instead of a re-analysis.
 
 Several files given to `chapters` are treated as one continuous recording, in
 the order written on the command line — the case where a single session was
@@ -29,12 +28,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from pathlib import Path
-from typing import List
 
 from .config import CutsConfig
-from .schema import format_timestamp, to_chapter_list, write_events
+from .schema import format_timestamp, read_events, to_chapter_list, write_events
 
 
 def _add_observe_args(p: argparse.ArgumentParser) -> None:
@@ -42,7 +39,7 @@ def _add_observe_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--interval", type=float, default=None,
                    help="seconds between sampled frames (default 30; lower "
                         "for fast-changing footage, at the cost of more "
-                        "VLM calls)")
+                        "description calls)")
     p.add_argument("--shard-sec", type=float, default=None,
                    help="seconds of timeline per independent shard "
                         "(default 300)")
@@ -57,25 +54,24 @@ def _add_observe_args(p: argparse.ArgumentParser) -> None:
                         "sample. Much slower on long input; only needed for "
                         "footage where seeking is unreliable")
     p.add_argument("--no-cache", action="store_true",
-                   help="do not read or write <video>.observations.jsonl")
+                   help="do not read or write the observations cache")
     p.add_argument("--no-vlm", action="store_true",
-                   help="disable the VLM text channel (visual signal only; "
-                        "also skips boundary refinement, which depends on it)")
+                   help="do not describe frames (curve segmenter only: "
+                        "visual channel alone, no refinement)")
     p.add_argument("--vlm-model", default=None,
                    help="model for per-frame screen descriptions "
                         "(default claude-haiku-4-5)")
     p.add_argument("--no-redact", action="store_true",
                    help="do NOT black out credentials (API keys, tokens, "
-                        "passwords) found in frames before they are uploaded. "
-                        "Only for footage you know is clean, or when a false "
-                        "positive is hiding something you need to see")
+                        "passwords) found in frames or speech before they are "
+                        "uploaded. Only for footage you know is clean")
     p.add_argument("--no-asr", action="store_true",
                    help="skip transcription even when the video has audio")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
-def _add_coalesce_args(p: argparse.ArgumentParser) -> None:
-    """Pass 2 knobs — shared by `chapters` and the standalone `coalesce`."""
+def _add_chapter_args(p: argparse.ArgumentParser) -> None:
+    """Pass 2 knobs — shared by `chapters` and `coalesce`."""
     p.add_argument("--intent", default=None,
                    help="what this index is FOR (\"a tutorial walkthrough\", "
                         "\"find where I broke the build\"). Coalescing judges "
@@ -93,41 +89,35 @@ def _add_coalesce_args(p: argparse.ArgumentParser) -> None:
                         "need exact on-screen strings")
     p.add_argument("--coalesce-model", default=None,
                    help="model for the coalescing call (default claude-opus-5)")
+    p.add_argument("--no-refine", action="store_true",
+                   help="skip the boundary-refinement pass (one extra look "
+                        "at each detected boundary's midpoint)")
+    p.add_argument("--backend", choices=["auto", "claude", "heuristic"],
+                   default="auto",
+                   help="where titles come from when the curve segmenter drew "
+                        "the chapters (including the fallback when coalescing "
+                        "fails). Default auto: Claude when credentials are "
+                        "present, else keyword heuristics")
+    p.add_argument("--no-labels", action="store_true",
+                   help="skip the separate titling call for curve chapters. "
+                        "LLM chapters are titled by the call that draws them")
+    p.add_argument("--no-join-boundaries", action="store_true",
+                   help="with multiple inputs, do NOT force a chapter break "
+                        "at each file join")
+    p.add_argument("-o", "--out", default=None,
+                   help="write the index JSON here")
 
 
-def _add_common(p: argparse.ArgumentParser) -> None:
-    _add_observe_args(p)
-    _add_coalesce_args(p)
+def _add_chapters_only(p: argparse.ArgumentParser) -> None:
     p.add_argument("--segmenter", choices=["llm", "curve"], default=None,
                    help="how chapter boundaries are decided. 'llm' (default) "
                         "reads every frame description and coalesces by "
                         "judgement; 'curve' uses the DINOv2+TF-IDF similarity "
-                        "curve and a count budget — deterministic, and the "
-                        "baseline to compare against")
-    p.add_argument("--vlm-stride", type=int, default=None,
-                   help="describe every Nth sample instead of every one "
-                        "(default 1); skipped samples inherit the last "
-                        "description. Curve segmenter only")
-    p.add_argument("--no-refine", action="store_true",
-                   help="skip the boundary-refinement pass (one extra VLM "
-                        "look at each detected boundary's midpoint)")
+                        "curve and a count budget — deterministic, the "
+                        "baseline to compare against, and the only mode that "
+                        "works without API credentials")
     p.add_argument("--no-dino", action="store_true",
-                   help="disable the DINOv2 visual channel. Curve segmenter "
-                        "only — the LLM segmenter never runs DINOv2")
-    p.add_argument("--backend", choices=["auto", "claude", "heuristic"],
-                   default="auto",
-                   help="chapter-title backend (default auto: Claude when "
-                        "credentials are present, else heuristic). Curve "
-                        "segmenter only; the LLM segmenter titles as it cuts")
-    p.add_argument("--no-labels", action="store_true",
-                   help="segment only; skip titling entirely")
-    p.add_argument("--no-join-boundaries", action="store_true",
-                   help="with multiple inputs, do NOT force a chapter break "
-                        "at each file join (default: force one, since a new "
-                        "file is a real break in the recording)")
-    p.add_argument("-o", "--out", default=None,
-                   help="write the full index JSON here "
-                        "(default: <first_video_stem>.events.json beside it)")
+                   help="disable the DINOv2 visual channel (curve segmenter)")
 
 
 def _apply_observe_args(cfg: CutsConfig, args) -> None:
@@ -156,8 +146,9 @@ def _apply_observe_args(cfg: CutsConfig, args) -> None:
         cfg.asr.enabled = False
 
 
-def _apply_coalesce_args(cfg: CutsConfig, args) -> None:
-    """Pass 2 flags. Shared between `coalesce` and `chapters`."""
+def _apply_chapter_args(cfg: CutsConfig, args) -> None:
+    """Pass 2 flags. Shared between `chapters` and `coalesce`."""
+    cfg.verbose = cfg.verbose or getattr(args, "verbose", False)
     if getattr(args, "intent", None):
         cfg.coalesce.intent = args.intent
     if getattr(args, "include_ocr", False):
@@ -168,28 +159,18 @@ def _apply_coalesce_args(cfg: CutsConfig, args) -> None:
         cfg.segmentation.target_events = args.chapters
     if getattr(args, "min_chapter", None) is not None:
         cfg.segmentation.min_event_sec = args.min_chapter
-
-
-def _config_from_args(args) -> CutsConfig:
-    cfg = CutsConfig()
-    _apply_observe_args(cfg, args)
-    _apply_coalesce_args(cfg, args)
+    if getattr(args, "no_refine", False):
+        cfg.refine.enabled = False
+    if getattr(args, "no_labels", False):
+        cfg.labeling.enabled = False
     if getattr(args, "segmenter", None):
         cfg.segmenter = args.segmenter
-    if args.vlm_stride is not None:
-        cfg.vlm.stride = max(1, args.vlm_stride)
-    if args.no_refine:
-        cfg.refine.enabled = False
-    if args.no_dino:
+    if getattr(args, "no_dino", False):
         cfg.segmentation.weight_dino = 0.0
-    if args.no_labels:
-        cfg.labeling.enabled = False
-        cfg.coalesce.enabled = False
-    if cfg.segmenter == "llm" and args.chapters is not None:
+    if cfg.segmenter == "llm" and getattr(args, "chapters", None) is not None:
         print("[cli] --chapters is ignored by the LLM segmenter, which "
               "decides the count from the content; use --segmenter curve "
               "to force a target")
-    return cfg
 
 
 def _resolve_videos(paths) -> list:
@@ -209,12 +190,34 @@ def _default_out_path(videos) -> str:
 
     Named after the first file, with a count suffix when there are several, so
     indexing the same first file with different companions does not silently
-    overwrite an earlier run.
+    overwrite an earlier run. The observation cache is named the same way.
     """
     first = Path(videos[0])
     if len(videos) == 1:
         return str(first.with_suffix(".events.json"))
     return str(first.with_name(f"{first.stem}+{len(videos) - 1}.events.json"))
+
+
+def _finish(result, cfg: CutsConfig, out_path: str) -> int:
+    """Write the index and print the chapter list. Shared by chapters/coalesce."""
+    write_events(out_path, result.video_id, result.timeline.first_path,
+                 result.events, duration_sec=result.duration_sec,
+                 sources=result.timeline.to_dicts(),
+                 extra=result.extra(cfg.coalesce.intent))
+
+    print()
+    print(to_chapter_list(result.events, show_source=result.is_multi))
+    print()
+    per_min = result.runtime_sec / max(result.duration_sec / 60.0, 1e-6)
+    across = f"across {format_timestamp(result.duration_sec)}"
+    if result.is_multi:
+        across += f" of {len(result.timeline)} files"
+    print(f"{len(result.events)} chapters from {result.n_samples} samples {across}")
+    print(f"segmenter: {result.segmenter}   titles: {result.titles}   "
+          f"signals: {', '.join(result.channels) or 'none'}")
+    print(f"{result.runtime_sec:.1f}s total ({per_min:.1f}s per video-minute)")
+    print(f"index: {out_path}")
+    return 0
 
 
 def cmd_probe(args) -> int:
@@ -238,196 +241,144 @@ def cmd_probe(args) -> int:
               f"{'yes' if meta['has_audio'] else 'no'}")
         total += dur
 
-    mins = total / 60.0
-    print(f"\ntimeline: {format_timestamp(total)} ({mins:.1f} min)")
+    print(f"\ntimeline: {format_timestamp(total)} ({total / 60.0:.1f} min)")
 
-    from .config import CutsConfig
     cfg = CutsConfig()
-    n_samples = int(total / cfg.sampling.sample_interval_sec)
-    # Decode is linear in total video length *regardless* of --interval:
-    # PyAV can only reliably seek to keyframes, so every frame gets decoded
-    # even when only one in thirty is kept (see cuts/media.py). ~4s/video-min
-    # for decode+DINO and ~1.5s/call for a VLM description are both rough
-    # guesses extrapolated from a short clip, not measurements at this scale.
-    decode_est_min = mins * 4 / 60
-    vlm_est_min = n_samples * 1.5 / max(1, cfg.vlm.concurrency) / 60
+    n_samples = int(total / cfg.sampling.sample_interval_sec) + 1
+    n_calls = -(-n_samples // cfg.vlm.frames_per_call)
+    # Rough per-unit costs, not measurements at scale: a seek + decode is
+    # ~0.1s and OCR (2x upscale, all cores) ~1s per sample, done
+    # ~workers-in-parallel but CPU-bound; a description call ~3s, overlapped
+    # up to LLMConfig.max_concurrency.
+    local_min = n_samples * 1.1 / 60
+    api_min = n_calls * 3.0 / max(1, cfg.llm.max_concurrency) / 60
     print(f"~{n_samples} samples at the default "
-          f"{cfg.sampling.sample_interval_sec:.0f}s interval")
-    print(f"estimated runtime: ~{decode_est_min + vlm_est_min:.0f} min "
-          f"(~{decode_est_min:.0f} min decode+DINO, roughly flat regardless "
-          f"of --interval, + ~{vlm_est_min:.0f} min of VLM calls at "
-          f"concurrency={cfg.vlm.concurrency})")
-    print("(rough order-of-magnitude estimate from a short clip and guessed "
-          "per-call latency, not a measurement at this scale)")
+          f"{cfg.sampling.sample_interval_sec:.0f}s interval, "
+          f"~{n_calls} description calls")
+    print(f"estimated Pass 1: ~{max(local_min, api_min):.0f}-"
+          f"{local_min + api_min:.0f} min (decode+OCR ~{local_min:.0f} min, "
+          f"calls ~{api_min:.0f} min at concurrency {cfg.llm.max_concurrency}; "
+          f"they overlap)")
+    print("(rough order-of-magnitude estimate, not a measurement; a cached "
+          "re-run skips Pass 1 entirely)")
     return 0
 
 
 def cmd_chapters(args) -> int:
     videos = _resolve_videos(args.video)
 
-    from .pipeline import run
+    from .pipeline import PipelineError, run
 
-    cfg = _config_from_args(args)
-    result = run(videos, cfg, label_backend=args.backend,
-                 join_boundaries=not args.no_join_boundaries)
-
-    if not result.events:
-        print("error: no events produced (video too short, or no usable signal)",
-              file=sys.stderr)
-        return 1
-
-    out_path = args.out or _default_out_path(videos)
-    sources = result.timeline.to_dicts() if result.timeline else None
-    write_events(out_path, result.video_id, videos[0], result.events,
-                 duration_sec=result.duration_sec,
-                 sources=sources,
-                 extra={
-                     "n_samples": result.n_samples,
-                     "channels": result.channels_used,
-                     "segmenter": result.segmenter,
-                     "intent": cfg.coalesce.intent,
-                     "label_backend": result.label_backend,
-                     "stage_times": result.stage_times,
-                 })
-
-    multi = result.is_multi
-    print()
-    print(to_chapter_list(result.events, show_source=multi))
-    print()
-    per_min = result.runtime_sec / max(result.duration_sec / 60.0, 1e-6)
-    across = f"across {format_timestamp(result.duration_sec)}"
-    if multi:
-        across += f" of {len(result.timeline)} files"
-    print(f"{len(result.events)} chapters from {result.n_samples} samples "
-          f"{across}")
-    print(f"signals: {', '.join(result.channels_used) or 'none'}   "
-          f"titles: {result.label_backend}")
-    print(f"{result.runtime_sec:.1f}s total ({per_min:.1f}s per video-minute)")
-    print(f"index: {out_path}")
-    return 0
+    cfg = CutsConfig()
+    _apply_observe_args(cfg, args)
+    _apply_chapter_args(cfg, args)
+    try:
+        result = run(videos, cfg, title_backend=args.backend,
+                     join_boundaries=not args.no_join_boundaries)
+    except PipelineError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return _finish(result, cfg, args.out or _default_out_path(videos))
 
 
 def cmd_observe(args) -> int:
     """Pass 1 alone: video(s) -> observations.jsonl.
 
-    Worth having as its own command for two reasons. It is the expensive half
-    of a run, so materializing it lets Pass 2 be re-run against a cache for
-    the price of one call. And it is the unit that eventually moves into a
-    container — being able to invoke it directly is what makes that testable.
+    Goes through the same `observe` (and cache) as `chapters`, so running it
+    and then `chapters` with the same sampling settings pays for Pass 1 once.
     """
     videos = _resolve_videos(args.video)
 
+    from . import llm
     from .media import Timeline
-    from .observe import observe, observations_path
+    from .observe import Work, observe, observations_path
+    from .pipeline import _NO_CREDENTIALS
 
     cfg = CutsConfig()
     _apply_observe_args(cfg, args)
+    llm.configure(cfg.llm.max_concurrency)
+    if cfg.vlm.enabled and not llm.has_credentials():
+        print(f"error: {_NO_CREDENTIALS}", file=sys.stderr)
+        return 2
 
     timeline = Timeline.build(videos)
-    out_path = args.out or observations_path(videos[0])
-    t0 = time.time()
-    # Goes through `observe` rather than `observe_timeline` so this honours the
-    # same cache `chapters` does — running it twice, or running it and then
-    # running `chapters`, must not pay for Pass 1 twice.
-    observations = observe(timeline, cfg, verbose=args.verbose,
-                           cache_path=out_path)
+    out_path = args.out or observations_path(videos)
+    observations = observe(
+        timeline, cfg,
+        Work(describe=cfg.vlm.enabled, embed=False, transcribe=cfg.asr.enabled),
+        verbose=args.verbose, cache_path=out_path,
+    )
     if not observations:
         print("error: no observations produced", file=sys.stderr)
         return 1
-
-    elapsed = time.time() - t0
-    described = sum(1 for o in observations if o.description)
-    withheld = sum(1 for o in observations if o.withheld)
-    print(f"\n{len(observations)} observations across "
-          f"{format_timestamp(timeline.duration_sec)} "
-          f"({described} described"
-          + (f", {withheld} withheld" if withheld else "") + ")")
-    print(f"{elapsed:.1f}s total "
-          f"({elapsed / max(timeline.duration_sec / 60.0, 1e-6):.1f}s per "
-          f"video-minute)")
     print(f"observations: {out_path}")
     return 0
 
 
 def cmd_coalesce(args) -> int:
-    """Pass 2 alone: observations.jsonl -> events.json.
+    """Everything after Pass 1, from a cache: observations.jsonl -> events.json.
 
-    This is the iteration loop. Coalescing is one call over cached text, so
-    trying a different intent, model or prompt costs cents and seconds rather
-    than a re-analysis of the footage.
+    The same code `chapters` runs after observing — coalescing, the curve
+    fallback, refinement (when the videos are still on disk) — so a
+    re-chapter differs from a full run only in not re-reading frames.
     """
     path = str(Path(args.observations).resolve())
     if not os.path.exists(path):
         print(f"error: not found: {path}", file=sys.stderr)
         return 2
 
-    from .coalesce import coalesce
+    from . import llm
     from .media import Timeline
-    from .observe import read_observations
+    from .observe import confirm_durations, read_observations, timeline_from_meta
+    from .pipeline import PipelineError, chapters_from_observations
 
     cfg = CutsConfig()
-    cfg.verbose = args.verbose
-    _apply_coalesce_args(cfg, args)
+    cfg.segmenter = "llm"
+    _apply_chapter_args(cfg, args)
+    llm.configure(cfg.llm.max_concurrency)
 
     observations, meta = read_observations(path)
     if not observations:
         print(f"error: no observations in {path}", file=sys.stderr)
         return 1
+    timeline = timeline_from_meta(meta, os.path.dirname(path))
+    if timeline is None:
+        # A version-1 cache recorded file paths but not the timeline layout.
+        files = [f[0] for f in meta.get("files", []) if os.path.exists(f[0])]
+        if not files:
+            print("error: this cache predates timeline layouts and its videos "
+                  "are gone; re-run `chapters` on the videos", file=sys.stderr)
+            return 1
+        timeline = Timeline.build(files)
+        confirm_durations(timeline)
 
-    files = [f[0] for f in meta.get("files", []) if os.path.exists(f[0])]
-    timeline = Timeline.build(files) if files else None
-    duration = timeline.duration_sec if timeline else observations[-1].t
+    try:
+        result = chapters_from_observations(
+            observations, timeline, cfg, title_backend=args.backend,
+            join_boundaries=not args.no_join_boundaries,
+        )
+    except PipelineError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    locked: List[int] = []
-    seen = set()
-    for i, o in enumerate(observations):
-        if o.source_index not in seen:
-            seen.add(o.source_index)
-            locked.append(i)
-
-    events, backend = coalesce(
-        observations, cfg.coalesce, cfg.segmentation,
-        video_id=Path(path).stem.replace(".observations", ""),
-        duration_sec=duration, timeline=timeline, locked=locked[1:],
-        verbose=args.verbose,
-    )
-    if not events:
-        print("error: coalescing produced no chapters", file=sys.stderr)
-        return 1
-
-    if timeline is not None:
-        from .pipeline import _attach_sources
-        _attach_sources(events, timeline)
-
-    out_path = args.out or str(Path(path).with_name(
-        Path(path).stem.replace(".observations", "") + ".events.json"))
-    write_events(out_path, Path(out_path).stem, files[0] if files else "",
-                 events, duration_sec=duration,
-                 sources=timeline.to_dicts() if timeline else None,
-                 extra={"segmenter": "llm", "intent": cfg.coalesce.intent,
-                        "n_observations": len(observations)})
-
-    print()
-    print(to_chapter_list(events, show_source=bool(timeline and timeline.is_multi)))
-    print(f"\n{len(events)} chapters from {len(observations)} observations "
-          f"({backend})")
-    for e in events:
-        print(f"  {e.timestamp():>7} [{e.metadata.get('kind', '?'):>7}] "
-              f"{e.duration_sec / 60:5.1f}min  {e.summary}")
-    print(f"index: {out_path}")
-    return 0
+    suffix = ".observations.jsonl"
+    default_out = (path[: -len(suffix)] + ".events.json" if path.endswith(suffix)
+                   else str(Path(path).with_suffix(".events.json")))
+    rc = _finish(result, cfg, args.out or default_out)
+    for e in result.events:
+        print(f"  {e.timestamp():>7} [{e.metadata.get('kind', '-'):>7}] "
+              f"{e.duration_sec / 60:5.1f}min  {e.reason}")
+    return rc
 
 
 def cmd_label(args) -> int:
     from .labeling import label_events
-    from .schema import read_events
+    from .media import Timeline
 
     path = str(Path(args.events_json).resolve())
     if not os.path.exists(path):
         print(f"error: not found: {path}", file=sys.stderr)
         return 2
-
-    from .media import Timeline
 
     cfg = CutsConfig()
     cfg.verbose = args.verbose
@@ -441,9 +392,11 @@ def cmd_label(args) -> int:
     used = label_events(events, timeline, cfg.labeling,
                         backend=args.backend, verbose=args.verbose,
                         ocr_config=cfg.ocr, redact_config=cfg.redact)
+    extra = dict(payload.get("extra") or {})
+    extra["titles"] = used
     write_events(path, payload["video_id"], payload["video_path"], events,
                  duration_sec=payload.get("duration_sec", 0.0),
-                 sources=payload["sources"])
+                 sources=payload["sources"], extra=extra)
     print()
     print(to_chapter_list(events, show_source=timeline.is_multi))
     print(f"\ntitles: {used}")
@@ -478,7 +431,9 @@ def main(argv=None) -> int:
     p_ch.add_argument("video", nargs="+",
                       help="one or more video files, in chronological order; "
                            "several are read as one continuous recording")
-    _add_common(p_ch)
+    _add_observe_args(p_ch)
+    _add_chapter_args(p_ch)
+    _add_chapters_only(p_ch)
     p_ch.set_defaults(func=cmd_chapters)
 
     p_pr = sub.add_parser("probe",
@@ -492,21 +447,20 @@ def main(argv=None) -> int:
     p_ob.add_argument("video", nargs="+")
     _add_observe_args(p_ob)
     p_ob.add_argument("-o", "--out", default=None,
-                      help="write observations here (default: "
-                           "<first_video_stem>.observations.jsonl)")
+                      help="write observations here (default: beside the "
+                           "first video, where `chapters` looks for them)")
     p_ob.set_defaults(func=cmd_observe)
 
     p_co = sub.add_parser(
         "coalesce",
-        help="Pass 2 only: observations.jsonl -> events.json")
+        help="everything after Pass 1, from a cache: observations.jsonl -> "
+             "events.json")
     p_co.add_argument("observations")
-    _add_coalesce_args(p_co)
-    p_co.add_argument("-o", "--out", default=None,
-                      help="write the index JSON here")
+    _add_chapter_args(p_co)
     p_co.add_argument("-v", "--verbose", action="store_true")
     p_co.set_defaults(func=cmd_coalesce)
 
-    p_lb = sub.add_parser("label", help="(re)label an existing events.json")
+    p_lb = sub.add_parser("label", help="(re)title an existing events.json")
     p_lb.add_argument("events_json")
     p_lb.add_argument("--backend", choices=["auto", "claude", "heuristic"],
                       default="auto")

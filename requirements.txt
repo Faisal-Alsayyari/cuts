@@ -1,23 +1,26 @@
 # Core: decoding, arrays, image ops
-av
-numpy
-opencv-python
-pillow
+av>=14
+numpy>=1.26
+opencv-python>=4.8
 
-# Visual channel (DINOv2 via transformers)
-torch
-torchvision
-transformers
+# On-screen text (grounds the frame descriptions; finds credentials to redact)
+rapidocr-onnxruntime>=1.2
 
-# Text channel (on-screen text)
-rapidocr-onnxruntime
+# Speech (optional at runtime; skipped if absent or the video has no audio)
+faster-whisper>=1.0
 
-# Speech channel (optional at runtime; degrades gracefully if absent)
-faster-whisper
+# Frame descriptions, chapters, titles
+anthropic>=1.0
+python-dotenv>=1.0
 
-# Chapter titles
-anthropic
-python-dotenv
+# --segmenter curve: DINOv2 visual channel (pip install -e '.[curve]')
+torch>=2.2
+torchvision>=0.17
+transformers>=4.40
+pillow>=10
 
-# EFS Stages 2-3 query-driven selection (cuts/select.py) — optional
-# open-clip-torch
+# Desktop GUI (pip install -e '.[gui]')
+PySide6>=6.6
+
+# Tests
+pytest>=8

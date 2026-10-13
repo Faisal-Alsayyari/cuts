@@ -5,17 +5,13 @@ what the user was doing — either as `cuts.coalesce` judged it, or as
 `cuts.segmentation` computed it. A `Chapter` is an `Event` that has been given
 a human-readable title. Note that an `Event` is *not* the unit Pass 1
 produces: that is an `Observation` (`cuts.observe`), a single timestamped
-frame. One event coalesces one or more observations.
+frame. One event coalesces one or more observations, and both segmenters
+build their events from the same observations (`cuts.chapters`).
 
-**Time is the canonical identifier.** Frame indices are still recorded when
-they are known, but they are advisory. Seek-based sampling reaches a frame by
-timestamp and never assigns it an ordinal (`media.iter_frames_at_times` sets
-`frame_idx = -1` deliberately), so an index is not something every event has —
-whereas a timestamp is what the chapter list displays, what transcript overlap
-is computed against, and what you need to open the footage.
-
-Both are still stored, because frame indices remain the VFR-safe way to name a
-frame *within a sequential decode*, which the `--segmenter curve` path does.
+**Time is the only identifier.** Every frame is reached by seeking to a
+timestamp, so there are no frame ordinals anywhere in the index. A timestamp
+is what the chapter list displays, what transcript overlap is computed
+against, and what you need to open the footage.
 
 A recording may be split across several files (one per day, say). Those are
 analyzed as a single continuous timeline, so `start_time` is always global —
@@ -29,9 +25,9 @@ JSON layout (one file per timeline, not per video file):
       "video_id":   "session-04",
       "video_path": "/abs/path/session-04.mp4",   # first source
       "duration_sec": 2712.4,
-      "sources": [ {path, index, duration_sec, time_offset,
-                    frame_offset, frame_span}, ... ],
-      "events": [Event, ...]
+      "sources": [ {path, index, duration_sec, time_offset}, ... ],
+      "events": [Event, ...],
+      "extra": {segmenter, titles, intent, n_samples, channels, ...}
     }
 """
 
@@ -53,41 +49,30 @@ class Event:
     event_id:
         Zero-padded index, unique within the video. Callers must not depend
         on the format.
-    start_frame, end_frame:
-        Inclusive ordinal frame indices (decode order, matching
-        `media.SampledFrame.frame_idx`), or -1 when unknown. Advisory: see
-        `sample_times` below.
     start_time, end_time:
-        Seconds from video start, computed from ``pts * time_base`` — never
-        from ``frame_idx / fps``. **These identify the event**; everything
-        downstream (opening the footage, re-decoding a frame, rendering the
-        chapter list) works from them.
+        Global seconds, computed from ``pts * time_base``. Events tile the
+        timeline: each ends where the next starts, the last at the end of the
+        recording. Boundary refinement may move a start earlier than its
+        first sample.
     title:
-        Human-readable chapter label ("debugging segfault"). Empty until
-        `cuts.labeling` has run.
-    summary:
-        Optional longer description, when the labeler produced one.
+        Human-readable chapter label ("debugging segfault"). Empty when no
+        title could be produced.
+    reason:
+        Why a chapter starts here, in the coalescing model's words ("obs
+        24-61 are all the same failing deploy log"). Empty for chapters the
+        curve segmenter produced.
     vlm_text:
-        Deduplicated per-frame screen descriptions observed across this
-        event's samples (see cuts.signals.vlm).
+        Deduplicated screen descriptions observed across this event's
+        samples (see cuts.signals.vlm).
     transcript_text:
-        Speech transcribed within this event's time window. Empty when the
-        source had no audio or ASR was disabled.
+        Speech transcribed within this event's samples. Empty when the source
+        had no audio or ASR was disabled.
     sample_times:
-        Global timestamps of the samples inside this event. **This is the
-        canonical membership record.** Seek-based sampling (`cuts.observe`)
-        reaches a frame by timestamp and never assigns it an ordinal, so time
-        is the only identifier that always exists.
-    sample_indices:
-        Frame indices of those same samples — advisory. Populated by the
-        `curve` path, which decodes sequentially and therefore knows the
-        ordinal; empty under the `llm` path.
+        Global timestamps of the observations inside this event — its
+        membership record.
     representative_times:
-        Global timestamps chosen to stand in for the event (thumbnails,
-        vision-based labeling). Preferred over `representative_frames`.
-    representative_frames:
-        The same choices as frame indices — advisory, on the same terms as
-        `sample_indices`.
+        Up to three interior sample times chosen to stand in for the event
+        (thumbnails, vision-based labeling).
     source_path, source_index, source_start_time:
         Which input file this event opens in, and how far into that file it
         starts. For a single-file input these are just the video itself and
@@ -96,25 +81,25 @@ class Event:
         offset you would have to work backwards from.
     metadata:
         Free-form bag. Stable keys:
-          * ``boundary_score``: fused similarity at the opening boundary
-            (lower = sharper transition into this event)
-          * ``merged_from``: number of initial partitions merged into this one
+          * ``segmenter``: "llm" or "curve" — which one drew this boundary
+          * ``kind``: pivotal | active | routine | idle (llm only)
+          * ``boundary_score``: fused similarity at the opening boundary,
+            lower = sharper transition (curve only)
+          * ``n_samples``: observations in the event
+          * ``n_withheld``: of those, frames never described because a
+            credential could not be painted over
     """
 
     video_id: str
     event_id: str
-    start_frame: int
-    end_frame: int
     start_time: float
     end_time: float
     title: str = ""
-    summary: str = ""
+    reason: str = ""
     vlm_text: str = ""
     transcript_text: str = ""
     sample_times: List[float] = field(default_factory=list)
-    sample_indices: List[int] = field(default_factory=list)
     representative_times: List[float] = field(default_factory=list)
-    representative_frames: List[int] = field(default_factory=list)
     source_path: str = ""
     source_index: int = 0
     source_start_time: float = 0.0
@@ -135,12 +120,7 @@ class Event:
 
     @property
     def combined_text(self) -> str:
-        """Text used for keyword / embedding indexing.
-
-        Screen description and transcript are joined with a double space so
-        tokenizers see them as distinct fields without inventing a separator
-        token.
-        """
+        """Screen descriptions and transcript, for keyword extraction."""
         if self.vlm_text and self.transcript_text:
             return f"{self.vlm_text}  {self.transcript_text}"
         return self.vlm_text or self.transcript_text
@@ -154,7 +134,12 @@ class Event:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Event":
-        # Tolerate extra keys written by future versions.
+        d = dict(d)
+        # Indexes written before `reason` existed kept the coalescing model's
+        # justification in `summary`.
+        if not d.get("reason") and d.get("summary"):
+            d["reason"] = d["summary"]
+        # Tolerate keys written by older or newer versions.
         known = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in d.items() if k in known})
 
@@ -192,6 +177,8 @@ def write_events(
 
     `sources` is the timeline layout. It is what lets `cuts label` re-open the
     right file for each event later without re-running the analysis pass.
+    `extra` carries run facts (segmenter, titles, intent, ...) and should be
+    passed through unchanged by anything that rewrites an existing index.
     """
     payload: Dict[str, Any] = {
         "video_id": video_id,
@@ -199,7 +186,7 @@ def write_events(
         "duration_sec": duration_sec,
         "sources": sources or [{
             "path": video_path, "index": 0, "duration_sec": duration_sec,
-            "time_offset": 0.0, "frame_offset": 0, "frame_span": 0,
+            "time_offset": 0.0,
         }],
         "events": [e.to_dict() for e in events],
     }
@@ -236,8 +223,6 @@ def read_events(path: str) -> Dict[str, Any]:
             "index": 0,
             "duration_sec": payload.get("duration_sec", 0.0),
             "time_offset": 0.0,
-            "frame_offset": 0,
-            "frame_span": 0,
         }]
     return payload
 

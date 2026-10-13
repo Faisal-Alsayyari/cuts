@@ -20,19 +20,24 @@ split across several days' worth of them.
 
 ## Install
 
-Requires Python 3.12 (3.13 lacks wheels for `ctranslate2`, faster-whisper's
-backend).
+Requires Python 3.12 or newer (tested on 3.14; on 3.13 check that
+`ctranslate2`, faster-whisper's backend, has a wheel for your platform).
 
 ```bash
-python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -e .              # chapters (the default llm segmenter)
+.venv/bin/pip install -e '.[curve]'     # + DINOv2 for --segmenter curve
+.venv/bin/pip install -e '.[gui]'       # + the desktop app (cuts-gui)
+.venv/bin/pip install -r requirements.txt   # or simply everything, incl. tests
 ```
 
-Model weights (DINOv2, Whisper) download locally on first use. The text
-channel and chapter titles both call the Claude API, so `ANTHROPIC_API_KEY`
-is required for a full run — without it the pipeline still produces chapters
-(segmenting on the visual channel alone, with crude keyword-derived titles),
-but the text signal that normally carries this domain is simply absent.
+Model weights (Whisper, and DINOv2 for the curve segmenter) download locally
+on first use. Frame descriptions, chapters and titles call the Claude API, so
+the default run **requires credentials** and refuses to start without them —
+before decoding anything, rather than running to completion and producing
+nothing useful. `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and an
+`ant auth login` profile all work. `--segmenter curve` runs without
+credentials: visual channel only, keyword-derived titles.
 
 The easiest way to set the key: `cp .env.example .env` and fill it in. The CLI
 loads `.env` automatically (see `_load_dotenv` in
@@ -56,20 +61,33 @@ python -m cuts coalesce session.observations.jsonl --intent "..."
 python -m cuts coalesce session.observations.jsonl --intent "something else"
 ```
 
-Observing is the expensive half and is cached; coalescing is one call over
-that cache. Trying a different intent or model costs cents and seconds instead
-of a full re-analysis of the footage.
+Observing is the expensive half and is cached; `coalesce` runs everything
+after Pass 1 over that cache — the same code `chapters` runs, including the
+transcript, the curve fallback and boundary refinement. Trying a different
+intent or model costs cents and seconds instead of a full re-analysis.
+
+The cache is written shard by shard, so **an interrupted run resumes** where
+it stopped, and a frame whose description call failed (rate limit, outage) is
+recorded as `failed` and **retried on the next run** rather than cached as an
+empty description. Every run prints how many samples were described, failed,
+withheld, or undecodable.
 
 Useful flags: `--interval` (sampling rate, default 30s), `--intent` (what the
 index is for), `--segmenter llm|curve`, `--min-chapter`, `--include-ocr`,
 `--shard-sec` / `--workers` / `--executor` / `--no-seek` (Pass 1 execution),
-`--no-cache`, `--vlm-model` / `--no-vlm`, `--no-refine`, `--no-asr`,
-`--no-redact`, `--no-labels`. Curve-only: `--chapters`, `--no-dino`,
-`--vlm-stride`, `--backend`.
+`--no-cache`, `--vlm-model`, `--no-refine`, `--no-asr`, `--no-redact`.
+Curve-only: `--chapters`, `--no-dino`, `--no-vlm`. Titles for curve chapters
+(and for the fallback): `--backend`, `--no-labels`.
 
 Each run writes `<video>.events.json` — the full index, including per-event
-screen descriptions, transcript, sample times, and the model's stated reason
-for each boundary. Pass 1 additionally writes `<video>.observations.jsonl`.
+screen descriptions, transcript, sample times, the model's stated reason for
+each boundary, and which segmenter and title source were used. Pass 1 writes
+`<video>.observations.jsonl` (`<video>+N...` for N extra files).
+
+There is also a desktop app — `python -m cuts_gui` (or `cuts-gui`) — for
+adding recordings, running analyses, and scrubbing through chapters and
+per-frame notes with a player and timeline. It runs the CLI as a subprocess
+and reads the files it writes.
 
 ## Recordings split across several files
 
@@ -142,7 +160,10 @@ within 0.03s of the requested time. Sampling the whole file takes ~14s against
 Observations are cached to `<video>.observations.jsonl` and reused. They are
 the expensive half of a run and they do not depend on how the footage is later
 carved up, so Pass 2 can be re-run any number of times — different `--intent`,
-different model — for the price of one API call.
+different model — for the price of one API call. The cache is keyed on the
+files' names and sizes (moving them keeps it), the interval, and the
+OCR/redaction settings; a different `--vlm-model` re-describes frames without
+discarding anything else, and the transcript is cached alongside.
 
 **Pass 2 decides chapters by reading, not by budgeting.** All observations go
 into a single call ([cuts/coalesce.py](cuts/coalesce.py)) which returns the
@@ -214,12 +235,19 @@ Two guarantees, both previously true by construction:
 
 If the coalescing call fails, the run does not lose Pass 1. It falls back to
 curve segmentation *over the observations already collected* — no re-decode,
-no DINOv2, one labeling call.
+one labeling call — and the index records `segmenter: llm->curve`.
 
 ### The older path: `--segmenter curve`
 
 Still present, still the deterministic baseline, and still what the numbers
-below were measured on.
+below were measured on. It now reads the same Pass 1 observations as the
+default path: when the curve is selected, Pass 1 also computes and caches a
+DINOv2 embedding per sample, so there is one sampling pipeline, one cache,
+and no separate sequential decode. (Its sample grid is therefore Pass 1's
+seek-based one, so boundaries are not byte-identical to curve runs from
+before that change.) Each dip in the curve is placed on the sharpest adjacent
+pair within it, so a clean cut starts the new chapter on the first sample
+after it rather than, by codec noise, half the time one sample early.
 
 **Stage 1 (segmentation)** implements
 [arXiv 2603.00983](https://arxiv.org/abs/2603.00983), *"Event-Anchored Frame
@@ -284,7 +312,8 @@ time and invent dissimilarity.
 recording of real work eventually catches a `.env` file, a terminal echoing a
 token, or a dashboard showing a live key — and every sampled frame goes to an
 external API. [cuts/redact.py](cuts/redact.py) sits in front of all three
-upload paths (sampling, refinement, labeling). It reuses the OCR pass that
+frame-upload paths (sampling, refinement, labeling), and the same patterns
+are applied to the speech transcript, which is sent as text. It reuses the OCR pass that
 already runs for grounding: the engine returns a bounding box with every line
 it reads, so a line matching a known credential shape is filled solid black in
 the frame *and* replaced with `[REDACTED]` in the grounding text — scrubbing
@@ -292,8 +321,9 @@ only the image would ship the key as a string instead of as pixels. The frame
 is mutated in place, so the redaction also survives into the local visual
 embedding. When a credential is found but cannot be tied to a box (split
 across two OCR lines), there is nothing to paint over and the frame is
-withheld from upload entirely; the sampling pass carries the previous
-description forward, so segmentation sees continuity rather than a gap. Hits
+withheld from upload entirely and recorded as `withheld`; the coalescing
+prompt says so, and the curve carries the previous description forward, so
+neither reads it as a change on screen. Hits
 are reported by pattern name (`openai_key`) and never by content — a run that
 finds something prints `[redact] blacked out credentials in 3 frame(s)`,
 which is also your cue to go rotate it.
@@ -319,24 +349,27 @@ only known to within ±15s, so refinement decodes the single frame at the
 midpoint, describes it, and asks a small classification call which half of
 the gap the transition actually falls in. This is one bisection, not a
 recursive search — the interval, not the chapter target, is the knob for
-gap-closing precision beyond that.
+gap-closing precision beyond that. Midpoints are described one per call: the
+description prompt treats a batch as consecutive frames, and the midpoints of
+different boundaries are not.
 
 **Labeling** sends every event's evidence to Claude in a single call, so titles
 stay distinct and consistently phrased across the video. Labeling each event
 separately reliably produces near-duplicate titles for adjacent events.
 
 **Stages 2-3 of the paper** (query-driven anchor selection + adaptive MMR) are
-implemented in [cuts/select.py](cuts/select.py) but are *not* used by chapter
-generation, which is query-free. They are the engine for the future "find the
-moment matching this description" workflow.
+not implemented; chapter generation is query-free. (An earlier, never-wired
+implementation lives in git history.)
 
 ## Layout
 
 | Module | Role |
 |--------|------|
 | [cuts/media.py](cuts/media.py) | VFR-safe decoding, seek-based + sequential sampling, multi-file timelines |
-| [cuts/observe.py](cuts/observe.py) | **Pass 1** — sharded independent observations, cache |
+| [cuts/observe.py](cuts/observe.py) | **Pass 1** — sharded independent observations, resumable cache, transcript |
 | [cuts/coalesce.py](cuts/coalesce.py) | **Pass 2** — cut points and titles, with validation |
+| [cuts/chapters.py](cuts/chapters.py) | Cut points -> gapless events, for both segmenters |
+| [cuts/llm.py](cuts/llm.py) | The one Claude client: credentials, global request cap, structured calls |
 | [cuts/signals/vlm.py](cuts/signals/vlm.py) | Per-frame screen descriptions |
 | [cuts/signals/ocr.py](cuts/signals/ocr.py) | Local OCR (grounds vlm.py's call; not an independent channel) |
 | [cuts/redact.py](cuts/redact.py) | Blacks out credentials in frames before upload |
@@ -344,14 +377,16 @@ moment matching this description" workflow.
 | [cuts/refine.py](cuts/refine.py) | Single-bisection boundary sharpening |
 | [cuts/signals/dino.py](cuts/signals/dino.py) | DINOv2 embeddings — `--segmenter curve` only |
 | [cuts/signals/text_features.py](cuts/signals/text_features.py) | TF-IDF vectors — `--segmenter curve` only |
-| [cuts/segmentation.py](cuts/segmentation.py) | EFS Stage 1 — `--segmenter curve` only |
-| [cuts/labeling.py](cuts/labeling.py) | Chapter titles — curve path and standalone `cuts label` |
-| [cuts/select.py](cuts/select.py) | EFS Stages 2-3, query-driven (unused today) |
-| [cuts/pipeline.py](cuts/pipeline.py) | Orchestrator |
+| [cuts/segmentation.py](cuts/segmentation.py) | EFS Stage 1 — `--segmenter curve`, and coalescing's fallback |
+| [cuts/labeling.py](cuts/labeling.py) | Chapter titles — curve chapters and standalone `cuts label` |
+| [cuts/pipeline.py](cuts/pipeline.py) | Orchestrator — one pipeline for both segmenters |
 | [cuts/cli.py](cuts/cli.py) | CLI |
+| [cuts_gui/](cuts_gui/) | Desktop app; talks to the CLI only through [cuts_gui/backend.py](cuts_gui/backend.py) |
+| [tests/](tests/) | `pytest` — synthetic videos and a scripted fake Claude, no network |
 
-Every module has a `python -m cuts.<module> <video>` debug entry point that
-runs and reports on that stage alone.
+Most modules have a `python -m cuts.<module> ...` debug entry point that runs
+and reports on that stage alone. `pytest` runs the test suite without any
+API calls.
 
 All tuning constants live in [cuts/config.py](cuts/config.py) as one
 `CutsConfig` dataclass. No module body hardcodes a threshold.
@@ -363,14 +398,12 @@ has not yet been carefully re-benchmarked at scale — treat everything in this
 section as an order-of-magnitude estimate (`cuts probe` prints one per input),
 not a measurement.
 
-- **Decode no longer grows with video length** under `--segmenter llm`.
-  Sampling seeks to each wanted frame rather than decode-parsing every frame
-  and discarding most, which was previously the floor under how fast any run
-  could go. Measured flat at ~0.08s per sample at 5%, 50% and 95% through an
+- **Decode no longer grows with video length.** Sampling seeks to each
+  wanted frame rather than decode-parsing every frame and discarding most.
+  Measured flat at ~0.08s per sample at 5%, 50% and 95% through an
   87-minute capture; whole-file sampling ~14s versus ~78s of sequential
-  decode. `--segmenter curve` still decodes sequentially and still has the
-  old floor. `--no-seek` forces the old behaviour if a container's seeking
-  turns out to be unreliable.
+  decode. Both segmenters now share this. `--no-seek` forces sequential
+  decode if a container's seeking turns out to be unreliable.
 - **Sharding does not buy much *local* parallelism, and that is measured
   rather than assumed.** RapidOCR's ONNX session already uses every core, so
   OCR is saturating the machine before shards are split at all. On 8 cores:
@@ -381,18 +414,16 @@ not a measurement.
   single-machine speedup in this design comes from seeking, not from
   sharding; sharding pays off when workers are separate machines, and in the
   meantime it pays for itself through the observation cache.
-- **The VLM channel is network-latency-bound**, not compute-bound. Calls are
-  submitted *without waiting*, so decoding (CPU) overlaps description calls
-  (network) instead of the two alternating; `VLMConfig.concurrency` (default
-  6) bounds calls in flight and `max_inflight_chunks` bounds how far decode
-  may run ahead, which is what keeps queued frames from growing without limit
-  on a long input. The OCR grounding step runs synchronously in the decode
-  loop since it's local compute — cheap at today's sample counts, but worth
-  watching if `--interval` is lowered a lot.
+- **The VLM channel is network-latency-bound**, not compute-bound. Shards
+  run in parallel, so one shard's description calls overlap another's
+  decode and OCR. Every API call in the run goes through one shared client
+  and one global cap on requests in flight (`LLMConfig.max_concurrency`,
+  default 8), so a many-core machine does not fire a burst per shard into
+  the rate limiter. OCR runs only on frames that will be uploaded.
 - **Boundary refinement is parallel too**: it gathers every midpoint frame
-  first (local decode + OCR), then describes them in one batched concurrent
-  pass and classifies every gap concurrently, rather than looping one
-  boundary at a time.
+  first (local decode + OCR), then describes them concurrently and
+  classifies every gap concurrently, rather than looping one boundary at a
+  time.
 - **Extrapolating to 30 hours** is untested at that scale in the new
   architecture; the numbers this section used to cite were measured under the
   local-OCR pipeline and no longer apply.
@@ -411,12 +442,11 @@ and each shard discards its frames as it goes.
 ## What this is not
 
 - No training. Inference only.
-- No offline / no-credentials mode. The text channel and chapter titles both
-  call the Claude API; without `ANTHROPIC_API_KEY` you get visual-only
-  segmentation and heuristic titles, not full offline operation.
+- No offline mode for the default path. Without credentials only
+  `--segmenter curve` runs: visual-only segmentation and heuristic titles.
 - No shot-boundary detection — it was removed; it does not describe what
   changes in a screen recording.
-- No web UI yet.
+- No web UI. There is a desktop app (`cuts_gui`).
 - **No agent layer yet, but the hinge for it exists.** `observe_shard` takes
   an explicit list of sample times rather than deriving them from an
   interval, so a `zoom(t0, t1, n)` tool is the same function with a different
@@ -456,9 +486,19 @@ The two-pass architecture is verified as follows:
   missing/`None`/string `start` values, a missing opening cut, 40 proposals
   below the minimum duration, dropped file joins, and entirely empty input.
   Every case yields a contiguous gapless partition covering all observations.
-- **The curve segmenter did not regress.** `--segmenter curve` reproduces
-  boundaries byte-identically against a pristine checkout at matched
-  intervals, so the deterministic baseline still means something.
+- **The curve segmenter is deterministic for a given observation cache.**
+  It was byte-identical to its earlier implementation until it moved onto
+  the Pass 1 sample grid; boundaries from before that change are not
+  directly comparable. On the synthetic fixtures in `tests/`, it places
+  every boundary on the first sample after the cut.
+
+The automated suite (`pytest`, no network: synthetic videos and a scripted
+fake Claude) covers the validation cases above, cache resumption after a
+crashed shard, retry of failed descriptions, embeddings added to an existing
+cache without re-describing, identical offsets on cached and fresh multi-file
+runs, credentials absent from every upload (re-OCR of the encoded frames)
+and from the spoken transcript, the fail-fast credential check, the
+coalescing fallback, and the GUI's reading of new and legacy indexes.
 
 Credential redaction is verified locally, without API calls, by intercepting
 the encoded bytes each upload path would actually send and re-OCRing them:
@@ -500,9 +540,11 @@ Not yet verified:
 - **Redaction against real footage.** The fixture plants credentials in a
   clean, high-contrast, synthetic render. Real captures are noisier, and
   recall depends entirely on whether OCR reads the credential at all.
-- **Multi-file timelines under the LLM segmenter.** Joins are locked as
-  boundaries and the code path is shared, but the real multi-day case has
-  only been exercised under the curve segmenter.
+- **Multi-file timelines under the LLM segmenter on real footage.** Joins
+  are locked as boundaries and tested on a synthetic two-file fixture, but
+  the real multi-day case has not been run end to end.
+- **The DINOv2 channel with real weights since the refactor.** Embeddings
+  are now computed inside Pass 1; the tests use a stand-in embedder.
 - **Anything past ~90 minutes.** An 87-minute real capture runs end to end;
   multi-hour inputs are extrapolation, and past ~1500 observations the
   single-call Pass 2 is a warning rather than a supported mode.

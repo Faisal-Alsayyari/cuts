@@ -1,5 +1,7 @@
 # 05 — Pass 2: coalescing, validation, and boundary refinement
 
+> **Pre-refactor.** This document describes the code at `c39a118`. The pipeline was since unified on branch `refactor/unify-pipeline`; see [12-unified-pipeline.md](12-unified-pipeline.md) for what changed.
+
 Code: `cuts/coalesce.py`, `cuts/refine.py`, the coalescing branch of
 `cuts/pipeline.py` (`_run_llm`, line 454).
 

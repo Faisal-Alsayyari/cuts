@@ -24,6 +24,20 @@ _MAX_PENDING = 48
 _CACHE_SIZE = 800
 
 
+def pixelate(img: QImage, factor: int = 28) -> QImage:
+    """A coarse mosaic of `img`, for frames that had credentials on screen.
+
+    Thumbnails are decoded from the local video, not from the redacted frame
+    that was uploaded, so the credential is in their pixels.
+    """
+    from PySide6.QtCore import Qt
+
+    small = img.scaled(max(1, img.width() // factor), max(1, img.height() // factor),
+                       Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    return small.scaled(img.width(), img.height(), Qt.IgnoreAspectRatio,
+                        Qt.SmoothTransformation)
+
+
 def _key(path: str, t: float, width: int) -> str:
     return f"{path}|{t:.2f}|{width}"
 
